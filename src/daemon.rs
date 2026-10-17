@@ -47,6 +47,8 @@ pub struct Daemon {
     pub wallets: RwLock<BTreeMap<String, Arc<Mutex<LoadedWallet>>>>,
     pub managers: RwLock<BTreeMap<String, Arc<crate::coinjoin_manager::CoinJoinManager>>>,
     pub node_height: RwLock<Option<u32>>,
+    /// Wallets with a scan in progress (the load-time scan and the periodic loop must not overlap).
+    pub syncing: std::sync::Mutex<std::collections::HashSet<String>>,
     pub fee_rates: RwLock<BTreeMap<u32, u32>>,
     pub shutdown: tokio::sync::Notify,
 }
@@ -100,6 +102,7 @@ impl Daemon {
             wallets: RwLock::new(BTreeMap::new()),
             managers: RwLock::new(BTreeMap::new()),
             node_height: RwLock::new(None),
+            syncing: std::sync::Mutex::new(std::collections::HashSet::new()),
             fee_rates: RwLock::new(BTreeMap::new()),
             shutdown: tokio::sync::Notify::new(),
         }))
@@ -163,6 +166,15 @@ impl Daemon {
     /// Scans one wallet to the current filter tip, releasing the wallet between batches so
     /// RPC calls keep answering during a long scan.
     pub async fn sync_wallet(self: &Arc<Self>, name: &str) -> anyhow::Result<()> {
+        if !self.syncing.lock().unwrap().insert(name.to_string()) {
+            return Ok(());
+        }
+        let r = self.sync_wallet_inner(name).await;
+        self.syncing.lock().unwrap().remove(name);
+        r
+    }
+
+    async fn sync_wallet_inner(self: &Arc<Self>, name: &str) -> anyhow::Result<()> {
         let Some(w) = self.get_wallet(name).await else { return Ok(()) };
         let tip = { self.filters.lock().await.tip_height().unwrap_or(0) };
         let mut height = {
