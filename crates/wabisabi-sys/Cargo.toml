@@ -1,0 +1,11 @@
+[package]
+name = "wabisabi-sys"
+version = "0.1.0"
+edition = "2021"
+links = "wabisabi"
+build = "build.rs"
+license = "MIT"
+description = "FFI bindings to libwabisabi (NWabiSabi C implementation of the WabiSabi KVAC protocol), built from vendored sources"
+
+[build-dependencies]
+cc = "1"

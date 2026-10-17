@@ -1,0 +1,17 @@
+[package]
+name = "wabisabi"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "WabiSabi credential client (KVAC) wire-compatible with Wasabi Wallet, backed by libwabisabi"
+
+[dependencies]
+wabisabi-sys = { path = "../wabisabi-sys" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+rand = { workspace = true }
+strobe-rs = "0.13"
+
+[dev-dependencies]
