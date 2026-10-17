@@ -1,6 +1,6 @@
 # sabid — Rust re-implementation of the Wasabi Wallet daemon
 
-Status: plan v1 (2026-10-17). Target: drop-in for `wassabee` (Wasabi daemon) as seen by
+Status: plan v1 (2026-10-17); progress log at the end. Target: drop-in for `wassabee` (Wasabi daemon) as seen by
 `sabi.py` and by the WabiSabi coordinator, with a hardware-wallet coinjoin path like
 Wasabi Preview 8, an MCP server for agents and a full CLI.
 
@@ -114,3 +114,23 @@ Key crates: `bitcoin` 0.32 (tx, script, bip158, psbt, taproot), `secp256k1` (sig
 - Crypto core via C FFI first, pure Rust later (the user asked for Rust; this is the one
   non-Rust piece and is isolated in `wabisabi-sys`).
 - Tor: reuse an existing SOCKS proxy if one answers; otherwise spawn Wasabi's bundled tor.
+
+## 6. Progress log
+
+- 2026-10-17 M0 done: credential roundtrips against the C issuer through coordinator JSON
+  (zero, real, reissue, presentation-only); round ids of live coinjoin.kruw.io rounds verify.
+- 2026-10-17 M1 done: wallet files load/save, scan over Wasabi's filter index (490k filters,
+  ~1300 filters/s in release), blocks from Wasabi's cache, the user's bitcoind over Tor, or P2P
+  onion peers; RPC methods getstatus, listwallets, loadwallet, getwalletinfo, listunspentcoins,
+  listcoins, gethistory, getnewaddress, listkeys, excludefromcoinjoin, getfeerates, startcoinjoin,
+  stopcoinjoin; sabi.py's own RPC client drives it. Scans release the wallet between batches.
+- 2026-10-17 M2 code complete, not yet exercised in a live round: coin selector, decomposer,
+  dependency graph + scheduler, Alice/Bob flow, signing, blame rounds, bans (PrisonedCoins.json),
+  soft key chain (BIP38 master key). First live test must use a dedicated small wallet.
+- 2026-10-17 M3 code complete, not yet tested on a device: Trezor over pytrezord/trezord
+  (authorize, ownership proofs, preauthorized SignTx), wired into startcoinjoin for wallets with a
+  SLIP-25 account and CoinJoinVendor = Trezor.
+- Open: anonymity-score analyzer port (stub: equal-output count), mempool scanning (only the
+  daemon's own coinjoins are tracked unconfirmed), remaining RPC (send/build/broadcast/payincoinjoin/
+  sweep/recover/create/import/enable/displayaddress/setcoinjoinlimits), MCP server, Coldcard/
+  Passport/Krux, input verification via bitcoind gettxout, pure-Rust crypto.

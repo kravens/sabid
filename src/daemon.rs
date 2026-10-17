@@ -172,29 +172,38 @@ impl Daemon {
         let mut total_new = 0u32;
         let mut last_log = std::time::Instant::now();
         while height <= tip {
-            let mut lw = w.lock().await;
-            let filters = self.filters.lock().await;
-            let LoadedWallet { km, store, .. } = &mut *lw;
-            let result = wallet::sync::scan_batch(km, store, &filters, &self.blocks, height, 2000).await;
-            drop(filters);
-            match result {
-                Ok((next, report)) => {
-                    total_new += report.new_txs;
-                    lw.sync_progress = Some((report.to, tip));
-                    if report.new_txs > 0 {
-                        lw.rebuild_state()?;
-                        tracing::info!("{name}: {} new transactions in {} blocks ({}..{})", report.new_txs, report.matched_blocks, report.from, report.to);
-                    }
-                    if next == height {
-                        break;
-                    }
-                    height = next;
-                }
+            // Short locks: filters only while reading rows, the wallet only for matching and processing.
+            let rows = { self.filters.lock().await.range(height, 2000)? };
+            if rows.is_empty() {
+                break;
+            }
+            let matched = {
+                let mut lw = w.lock().await;
+                wallet::sync::match_batch(&mut lw.km, &rows)?
+            };
+            let blocks = match wallet::sync::fetch_blocks(&self.blocks, &rows, &matched).await {
+                Ok(b) => b,
                 Err(e) => {
-                    lw.last_error = Some(e.to_string());
+                    w.lock().await.last_error = Some(e.to_string());
                     return Err(e);
                 }
+            };
+            let (next, report) = {
+                let mut lw = w.lock().await;
+                let LoadedWallet { km, store, .. } = &mut *lw;
+                let r = wallet::sync::process_batch(km, store, &rows, &blocks)?;
+                lw.sync_progress = Some((r.1.to, tip));
+                if r.1.new_txs > 0 {
+                    lw.rebuild_state()?;
+                    tracing::info!("{name}: {} new transactions in {} blocks ({}..{})", r.1.new_txs, r.1.matched_blocks, r.1.from, r.1.to);
+                }
+                r
+            };
+            total_new += report.new_txs;
+            if next == height {
+                break;
             }
+            height = next;
             if last_log.elapsed().as_secs() >= 10 {
                 tracing::info!("{name}: scanned to {} / {tip}", height - 1);
                 last_log = std::time::Instant::now();

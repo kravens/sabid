@@ -2,7 +2,7 @@
 //! wallet's transactions. Blocks come from Wasabi's on-disk block cache when present, else bitcoind.
 
 use crate::bitcoind::Bitcoind;
-use crate::filters::{FilterStore, SEGWIT_ACTIVATION_HEIGHT};
+use crate::filters::{FilterRow, SEGWIT_ACTIVATION_HEIGHT};
 use crate::keymanager::KeyManager;
 use crate::store::WalletStore;
 use bitcoin::bip158::BlockFilter;
@@ -72,22 +72,34 @@ pub fn scan_start(km: &KeyManager, store: &WalletStore) -> u32 {
     }
 }
 
-/// Scans at most `limit` filters from `height`; the caller loops (and may release the wallet
-/// between batches). Returns the next height to scan and what this batch found.
-pub async fn scan_batch(
-    km: &mut KeyManager,
-    store: &WalletStore,
-    filters: &FilterStore,
-    blocks: &BlockSource,
-    height: u32,
-    limit: usize,
-) -> anyhow::Result<(u32, ScanReport)> {
-    let mut report = ScanReport { from: height, to: height, ..Default::default() };
-    let rows = filters.range(height, limit)?;
-    if rows.is_empty() {
-        return Ok((height, report));
+/// Phase 1 (under the wallet lock, CPU only): which of `rows` match the wallet's scripts.
+pub fn match_batch(km: &mut KeyManager, rows: &[FilterRow]) -> anyhow::Result<Vec<usize>> {
+    km.ensure_gap();
+    let scripts = km.scripts();
+    let mut matched = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        let filter = BlockFilter::new(&row.filter);
+        if filter.match_any(&row.block_hash, &mut scripts.iter().map(|s| s.as_bytes()))? {
+            matched.push(i);
+        }
     }
-    // Our outpoints so far, to pick the relevant transactions out of a matched block.
+    Ok(matched)
+}
+
+/// Phase 2 (no locks, network): the matched blocks.
+pub async fn fetch_blocks(blocks: &BlockSource, rows: &[FilterRow], matched: &[usize]) -> anyhow::Result<Vec<(usize, Block)>> {
+    let mut out = Vec::with_capacity(matched.len());
+    for &i in matched {
+        out.push((i, blocks.get(&rows[i].block_hash).await?));
+    }
+    Ok(out)
+}
+
+/// Phase 3 (under the wallet lock): store the wallet's transactions of the matched blocks and
+/// advance the synced height through the whole batch. Returns the next height and the report.
+pub fn process_batch(km: &mut KeyManager, store: &WalletStore, rows: &[FilterRow], blocks: &[(usize, Block)]) -> anyhow::Result<(u32, ScanReport)> {
+    let Some(first) = rows.first() else { anyhow::bail!("empty batch") };
+    let mut report = ScanReport { from: first.height, to: first.height, ..Default::default() };
     let mut our_outpoints: HashSet<OutPoint> = HashSet::new();
     for st in store.all_txs()? {
         for (i, o) in st.tx.output.iter().enumerate() {
@@ -96,19 +108,15 @@ pub async fn scan_batch(
             }
         }
     }
-    km.ensure_gap();
-    let mut scripts = km.scripts();
-    let mut next = height;
-    for row in &rows {
+    let mut keys_changed = false;
+    let mut next = first.height;
+    let mut block_iter = blocks.iter().peekable();
+    for (i, row) in rows.iter().enumerate() {
         if row.height != next {
             anyhow::bail!("filter store has a gap at height {next} (got {})", row.height);
         }
-        let filter = BlockFilter::new(&row.filter);
-        let hit = filter.match_any(&row.block_hash, &mut scripts.iter().map(|s| s.as_bytes()))?;
-        if hit {
+        if let Some((_, block)) = block_iter.next_if(|(bi, _)| *bi == i) {
             report.matched_blocks += 1;
-            let block = blocks.get(&row.block_hash).await?;
-            let mut keys_changed = false;
             for (idx, tx) in block.txdata.iter().enumerate() {
                 let spends_ours = tx.input.iter().any(|i| our_outpoints.contains(&i.previous_output));
                 let pays_ours = tx.output.iter().any(|o| km.key_for_script(&o.script_pubkey).is_some());
@@ -128,14 +136,14 @@ pub async fn scan_batch(
                     }
                 }
             }
-            if keys_changed && km.ensure_gap() {
-                scripts = km.scripts();
-                km.save().ok();
-            }
         }
         store.set_synced(row.height, &row.block_hash)?;
         report.to = row.height;
         next = row.height + 1;
+    }
+    if keys_changed {
+        km.ensure_gap();
+        km.save().ok();
     }
     Ok((next, report))
 }
