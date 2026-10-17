@@ -117,8 +117,7 @@ pub struct Coin {
     pub label: String,
     pub height: u32,
     pub spender: Option<Txid>,
-    /// ponytail: heuristic (1, or the equal-output count in an own coinjoin); the real
-    /// BlockchainAnalyzer port replaces it in M2.
+    /// Wasabi `BlockchainAnalyzer` score of the coin's key.
     pub anonymity_set: f64,
     pub excluded_from_coinjoin: bool,
     pub is_own_coinjoin_output: bool,
@@ -157,16 +156,19 @@ impl WalletState {
         let excluded: HashSet<OutPoint> = km.excluded_coins().into_iter().collect();
         let mut coins: BTreeMap<OutPoint, Coin> = BTreeMap::new();
         let mut history = Vec::new();
+        let mut analyzer = crate::analyzer::Analyzer::default();
         for st in txs {
             let txid = st.txid;
             let mut amount: i64 = 0;
             let mut wallet_inputs = 0;
             let mut labels: Vec<String> = Vec::new();
+            let mut spent_refs: Vec<crate::analyzer::CoinRef> = Vec::new();
             for input in &st.tx.input {
                 if let Some(c) = coins.get_mut(&input.previous_output) {
                     c.spender = Some(txid);
                     amount -= c.amount as i64;
                     wallet_inputs += 1;
+                    spent_refs.push(crate::analyzer::CoinRef { outpoint: c.outpoint, script: c.script.clone(), amount: c.amount as i64 });
                     if !c.label.is_empty() && !labels.contains(&c.label) {
                         labels.push(c.label.clone());
                     }
@@ -206,6 +208,15 @@ impl WalletState {
                     },
                 );
             }
+            let out_refs: Vec<crate::analyzer::CoinRef> = st
+                .tx
+                .output
+                .iter()
+                .enumerate()
+                .filter(|(_, o)| by_script.contains_key(&o.script_pubkey))
+                .map(|(vout, o)| crate::analyzer::CoinRef { outpoint: OutPoint { txid, vout: vout as u32 }, script: o.script_pubkey.clone(), amount: o.value.to_sat() as i64 })
+                .collect();
+            analyzer.analyze(&st.tx, spent_refs, out_refs);
             if keys_changed && km.ensure_gap() {
                 by_script = km.keys.iter().enumerate().map(|(i, k)| (k.script.clone(), i)).collect();
             }
@@ -220,7 +231,11 @@ impl WalletState {
                 total_inputs: st.tx.input.len(),
             });
         }
-        (WalletState { coins: coins.into_values().collect(), history }, keys_changed)
+        let mut coins: Vec<Coin> = coins.into_values().collect();
+        for c in &mut coins {
+            c.anonymity_set = analyzer.anonymity_set(&c.script);
+        }
+        (WalletState { coins, history }, keys_changed)
     }
 
     pub fn unspent(&self) -> impl Iterator<Item = &Coin> {

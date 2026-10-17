@@ -2,6 +2,7 @@
 //! matching against Wasabi's local filter index (plus our own extension), block fetching through
 //! bitcoind, coin/history derivation.
 
+pub mod analyzer;
 pub mod bitcoind;
 pub mod filters;
 pub mod keymanager;
