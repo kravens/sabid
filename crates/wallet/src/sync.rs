@@ -88,11 +88,35 @@ pub fn match_batch(km: &mut KeyManager, rows: &[FilterRow]) -> anyhow::Result<Ve
 
 /// Phase 2 (no locks, network): the matched blocks.
 pub async fn fetch_blocks(blocks: &BlockSource, rows: &[FilterRow], matched: &[usize]) -> anyhow::Result<Vec<(usize, Block)>> {
+    // Four downloads at a time: most matches are filter false positives and the blocks come over Tor.
     let mut out = Vec::with_capacity(matched.len());
-    for &i in matched {
-        out.push((i, blocks.get(&rows[i].block_hash).await?));
+    for chunk in matched.chunks(4) {
+        let futs = chunk.iter().map(|&i| async move { blocks.get(&rows[i].block_hash).await.map(|b| (i, b)) });
+        for r in join_all(futs).await {
+            out.push(r?);
+        }
     }
+    out.sort_by_key(|(i, _)| *i);
     Ok(out)
+}
+
+async fn join_all<F: std::future::Future>(futs: impl IntoIterator<Item = F>) -> Vec<F::Output> {
+    let mut handles: Vec<std::pin::Pin<Box<F>>> = futs.into_iter().map(Box::pin).collect();
+    let mut results: Vec<Option<F::Output>> = (0..handles.len()).map(|_| None).collect();
+    std::future::poll_fn(|cx| {
+        let mut done = true;
+        for (i, h) in handles.iter_mut().enumerate() {
+            if results[i].is_none() {
+                match h.as_mut().poll(cx) {
+                    std::task::Poll::Ready(v) => results[i] = Some(v),
+                    std::task::Poll::Pending => done = false,
+                }
+            }
+        }
+        if done { std::task::Poll::Ready(()) } else { std::task::Poll::Pending }
+    })
+    .await;
+    results.into_iter().map(|r| r.unwrap()).collect()
 }
 
 /// Phase 3 (under the wallet lock): store the wallet's transactions of the matched blocks and
