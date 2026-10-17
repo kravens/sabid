@@ -1,0 +1,145 @@
+//! Scan: match every filter against the wallet's scripts, fetch matching blocks, store the
+//! wallet's transactions. Blocks come from Wasabi's on-disk block cache when present, else bitcoind.
+
+use crate::bitcoind::Bitcoind;
+use crate::filters::{FilterStore, SEGWIT_ACTIVATION_HEIGHT};
+use crate::keymanager::KeyManager;
+use crate::store::WalletStore;
+use bitcoin::bip158::BlockFilter;
+use bitcoin::consensus::encode::deserialize;
+use bitcoin::{Block, BlockHash, OutPoint};
+use std::collections::HashSet;
+use std::path::PathBuf;
+
+pub struct BlockSource {
+    /// Wasabi's `BitcoinStore/<net>/Blocks/` (files named by block hash)
+    pub wasabi_blocks_dir: Option<PathBuf>,
+    pub own_blocks_dir: PathBuf,
+    pub bitcoind: Option<Bitcoind>,
+    pub p2p: Option<crate::p2p::P2pBlockFetcher>,
+}
+
+impl BlockSource {
+    pub async fn get(&self, hash: &BlockHash) -> anyhow::Result<Block> {
+        let name = hash.to_string();
+        for dir in self.wasabi_blocks_dir.iter().chain(std::iter::once(&self.own_blocks_dir)) {
+            let p = dir.join(&name);
+            if let Ok(raw) = std::fs::read(&p) {
+                if let Ok(b) = deserialize::<Block>(&raw) {
+                    return Ok(b);
+                }
+            }
+        }
+        let mut last_err = anyhow::anyhow!("block {name}: no block source configured");
+        if let Some(node) = &self.bitcoind {
+            match node.get_block(hash).await {
+                Ok(b) => return Ok(self.cache(b)),
+                Err(e) => {
+                    tracing::debug!("bitcoind getblock {name}: {e}");
+                    last_err = e.into();
+                }
+            }
+        }
+        if let Some(p2p) = &self.p2p {
+            match p2p.get_block(hash, 6).await {
+                Ok(b) => return Ok(self.cache(b)),
+                Err(e) => last_err = e,
+            }
+        }
+        Err(last_err)
+    }
+
+    fn cache(&self, block: Block) -> Block {
+        std::fs::create_dir_all(&self.own_blocks_dir).ok();
+        std::fs::write(self.own_blocks_dir.join(block.block_hash().to_string()), bitcoin::consensus::encode::serialize(&block)).ok();
+        block
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ScanReport {
+    pub from: u32,
+    pub to: u32,
+    pub matched_blocks: u32,
+    pub new_txs: u32,
+}
+
+/// Scans from the store's synced height (or the wallet's birth height) to the filter tip.
+/// `progress(height, tip)` is called per batch.
+pub async fn scan(
+    km: &mut KeyManager,
+    store: &WalletStore,
+    filters: &FilterStore,
+    blocks: &BlockSource,
+    mut progress: impl FnMut(u32, u32),
+) -> anyhow::Result<ScanReport> {
+    let Some(tip) = filters.tip_height() else { return Ok(ScanReport::default()) };
+    let start = match store.synced_height() {
+        Some(h) => h + 1,
+        None => km.birth_height().unwrap_or(SEGWIT_ACTIVATION_HEIGHT).max(SEGWIT_ACTIVATION_HEIGHT),
+    };
+    let mut report = ScanReport { from: start, to: tip, ..Default::default() };
+    if start > tip {
+        return Ok(report);
+    }
+    // Our outpoints so far, to catch spends of coins whose scripts we already know (the filter
+    // also contains the spent prevout scripts, so script matching alone finds them; the set is
+    // only used to pick the relevant transactions out of a matched block).
+    let mut our_outpoints: HashSet<OutPoint> = HashSet::new();
+    for st in store.all_txs()? {
+        for (i, o) in st.tx.output.iter().enumerate() {
+            if km.key_for_script(&o.script_pubkey).is_some() {
+                our_outpoints.insert(OutPoint { txid: st.txid, vout: i as u32 });
+            }
+        }
+    }
+    km.ensure_gap();
+    let mut scripts = km.scripts();
+    let mut height = start;
+    const BATCH: usize = 2000;
+    while height <= tip {
+        let rows = filters.range(height, BATCH)?;
+        if rows.is_empty() {
+            break;
+        }
+        for row in &rows {
+            if row.height != height {
+                anyhow::bail!("filter store has a gap at height {height} (got {})", row.height);
+            }
+            let filter = BlockFilter::new(&row.filter);
+            let hit = filter.match_any(&row.block_hash, &mut scripts.iter().map(|s| s.as_bytes()))?;
+            if hit {
+                report.matched_blocks += 1;
+                let block = blocks.get(&row.block_hash).await?;
+                let mut keys_changed = false;
+                for (idx, tx) in block.txdata.iter().enumerate() {
+                    let spends_ours = tx.input.iter().any(|i| our_outpoints.contains(&i.previous_output));
+                    let pays_ours = tx.output.iter().any(|o| km.key_for_script(&o.script_pubkey).is_some());
+                    if !spends_ours && !pays_ours {
+                        continue;
+                    }
+                    let txid = tx.compute_txid();
+                    store.insert_tx(tx, row.height, &row.block_hash, idx as u32, row.time)?;
+                    report.new_txs += 1;
+                    for (vout, o) in tx.output.iter().enumerate() {
+                        if let Some(k) = km.key_for_script_mut(&o.script_pubkey) {
+                            if k.state != crate::keymanager::KeyState::Used {
+                                k.state = crate::keymanager::KeyState::Used;
+                                keys_changed = true;
+                            }
+                            our_outpoints.insert(OutPoint { txid, vout: vout as u32 });
+                        }
+                    }
+                }
+                if keys_changed && km.ensure_gap() {
+                    scripts = km.scripts();
+                    km.save().ok();
+                }
+            }
+            store.set_synced(row.height, &row.block_hash)?;
+            height = row.height + 1;
+        }
+        progress(height - 1, tip);
+    }
+    Ok(report)
+}

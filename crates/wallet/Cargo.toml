@@ -1,0 +1,23 @@
+[package]
+name = "wallet"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Wasabi-compatible wallet: KeyManager wallet files, BIP158 sync over bitcoind, coins and history"
+
+[dependencies]
+wasabi-proto = { path = "../wasabi-proto" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+bitcoin = { workspace = true }
+tracing = { workspace = true }
+rusqlite = { version = "0.32", features = ["bundled"] }
+base64 = "0.22"
+tokio-socks = "0.5"
+rand = { workspace = true }

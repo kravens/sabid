@@ -1,0 +1,22 @@
+[package]
+name = "coinjoin"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "WabiSabi coinjoin client logic ported from Wasabi Wallet: coin selection, amount decomposition, credential dependency graph, round flow"
+
+[dependencies]
+wabisabi = { path = "../wabisabi" }
+wasabi-proto = { path = "../wasabi-proto" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+bitcoin = { workspace = true }
+rand = { workspace = true }
+tracing = { workspace = true }
+bip38 = "1"
+base64 = "0.22"
