@@ -1,3 +1,4 @@
+mod coinjoin_manager;
 mod config;
 mod daemon;
 mod methods;
@@ -146,7 +147,7 @@ async fn main() -> anyhow::Result<()> {
                 None => serde_json::json!([]),
             };
             let body = serde_json::json!({"jsonrpc": "2.0", "id": "1", "method": method, "params": params});
-            let mut req = reqwest::Client::new().post(&target).header("content-type", "application/json").body(body.to_string());
+            let mut req = reqwest::Client::builder().timeout(std::time::Duration::from_secs(120)).build()?.post(&target).header("content-type", "application/json").body(body.to_string());
             if !cfg.json_rpc_user.is_empty() {
                 req = req.basic_auth(&cfg.json_rpc_user, Some(&cfg.json_rpc_password));
             }

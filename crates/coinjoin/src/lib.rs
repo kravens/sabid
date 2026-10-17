@@ -1,7 +1,10 @@
 //! WabiSabi coinjoin client logic, ported function by function from Wasabi Wallet so that a
 //! sabid round is indistinguishable from a Wasabi round to the coordinator and to observers.
 
+pub mod arena;
+pub mod client;
 pub mod decomposer;
+pub mod destinations;
 pub mod depgraph;
 pub mod keychain;
 pub mod ownership;

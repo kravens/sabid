@@ -64,27 +64,30 @@ pub struct ScanReport {
     pub new_txs: u32,
 }
 
-/// Scans from the store's synced height (or the wallet's birth height) to the filter tip.
-/// `progress(height, tip)` is called per batch.
-pub async fn scan(
+/// Where a wallet scan starts: the store's synced height + 1, or the wallet's birth height.
+pub fn scan_start(km: &KeyManager, store: &WalletStore) -> u32 {
+    match store.synced_height() {
+        Some(h) => h + 1,
+        None => km.birth_height().unwrap_or(SEGWIT_ACTIVATION_HEIGHT).max(SEGWIT_ACTIVATION_HEIGHT),
+    }
+}
+
+/// Scans at most `limit` filters from `height`; the caller loops (and may release the wallet
+/// between batches). Returns the next height to scan and what this batch found.
+pub async fn scan_batch(
     km: &mut KeyManager,
     store: &WalletStore,
     filters: &FilterStore,
     blocks: &BlockSource,
-    mut progress: impl FnMut(u32, u32),
-) -> anyhow::Result<ScanReport> {
-    let Some(tip) = filters.tip_height() else { return Ok(ScanReport::default()) };
-    let start = match store.synced_height() {
-        Some(h) => h + 1,
-        None => km.birth_height().unwrap_or(SEGWIT_ACTIVATION_HEIGHT).max(SEGWIT_ACTIVATION_HEIGHT),
-    };
-    let mut report = ScanReport { from: start, to: tip, ..Default::default() };
-    if start > tip {
-        return Ok(report);
+    height: u32,
+    limit: usize,
+) -> anyhow::Result<(u32, ScanReport)> {
+    let mut report = ScanReport { from: height, to: height, ..Default::default() };
+    let rows = filters.range(height, limit)?;
+    if rows.is_empty() {
+        return Ok((height, report));
     }
-    // Our outpoints so far, to catch spends of coins whose scripts we already know (the filter
-    // also contains the spent prevout scripts, so script matching alone finds them; the set is
-    // only used to pick the relevant transactions out of a matched block).
+    // Our outpoints so far, to pick the relevant transactions out of a matched block.
     let mut our_outpoints: HashSet<OutPoint> = HashSet::new();
     for st in store.all_txs()? {
         for (i, o) in st.tx.output.iter().enumerate() {
@@ -95,51 +98,44 @@ pub async fn scan(
     }
     km.ensure_gap();
     let mut scripts = km.scripts();
-    let mut height = start;
-    const BATCH: usize = 2000;
-    while height <= tip {
-        let rows = filters.range(height, BATCH)?;
-        if rows.is_empty() {
-            break;
+    let mut next = height;
+    for row in &rows {
+        if row.height != next {
+            anyhow::bail!("filter store has a gap at height {next} (got {})", row.height);
         }
-        for row in &rows {
-            if row.height != height {
-                anyhow::bail!("filter store has a gap at height {height} (got {})", row.height);
-            }
-            let filter = BlockFilter::new(&row.filter);
-            let hit = filter.match_any(&row.block_hash, &mut scripts.iter().map(|s| s.as_bytes()))?;
-            if hit {
-                report.matched_blocks += 1;
-                let block = blocks.get(&row.block_hash).await?;
-                let mut keys_changed = false;
-                for (idx, tx) in block.txdata.iter().enumerate() {
-                    let spends_ours = tx.input.iter().any(|i| our_outpoints.contains(&i.previous_output));
-                    let pays_ours = tx.output.iter().any(|o| km.key_for_script(&o.script_pubkey).is_some());
-                    if !spends_ours && !pays_ours {
-                        continue;
-                    }
-                    let txid = tx.compute_txid();
-                    store.insert_tx(tx, row.height, &row.block_hash, idx as u32, row.time)?;
-                    report.new_txs += 1;
-                    for (vout, o) in tx.output.iter().enumerate() {
-                        if let Some(k) = km.key_for_script_mut(&o.script_pubkey) {
-                            if k.state != crate::keymanager::KeyState::Used {
-                                k.state = crate::keymanager::KeyState::Used;
-                                keys_changed = true;
-                            }
-                            our_outpoints.insert(OutPoint { txid, vout: vout as u32 });
+        let filter = BlockFilter::new(&row.filter);
+        let hit = filter.match_any(&row.block_hash, &mut scripts.iter().map(|s| s.as_bytes()))?;
+        if hit {
+            report.matched_blocks += 1;
+            let block = blocks.get(&row.block_hash).await?;
+            let mut keys_changed = false;
+            for (idx, tx) in block.txdata.iter().enumerate() {
+                let spends_ours = tx.input.iter().any(|i| our_outpoints.contains(&i.previous_output));
+                let pays_ours = tx.output.iter().any(|o| km.key_for_script(&o.script_pubkey).is_some());
+                if !spends_ours && !pays_ours {
+                    continue;
+                }
+                let txid = tx.compute_txid();
+                store.insert_tx(tx, row.height, &row.block_hash, idx as u32, row.time)?;
+                report.new_txs += 1;
+                for (vout, o) in tx.output.iter().enumerate() {
+                    if let Some(k) = km.key_for_script_mut(&o.script_pubkey) {
+                        if k.state != crate::keymanager::KeyState::Used {
+                            k.state = crate::keymanager::KeyState::Used;
+                            keys_changed = true;
                         }
+                        our_outpoints.insert(OutPoint { txid, vout: vout as u32 });
                     }
                 }
-                if keys_changed && km.ensure_gap() {
-                    scripts = km.scripts();
-                    km.save().ok();
-                }
             }
-            store.set_synced(row.height, &row.block_hash)?;
-            height = row.height + 1;
+            if keys_changed && km.ensure_gap() {
+                scripts = km.scripts();
+                km.save().ok();
+            }
         }
-        progress(height - 1, tip);
+        store.set_synced(row.height, &row.block_hash)?;
+        report.to = row.height;
+        next = row.height + 1;
     }
-    Ok(report)
+    Ok((next, report))
 }

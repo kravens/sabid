@@ -10,6 +10,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
+/// Wasabi `Height.Mempool`: unconfirmed transactions sort after every block.
+pub const MEMPOOL_HEIGHT: u32 = i32::MAX as u32 - 1;
+
 pub struct WalletStore {
     conn: Mutex<Connection>,
 }

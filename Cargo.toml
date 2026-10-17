@@ -27,6 +27,10 @@ license = "MIT"
 wabisabi = { path = "crates/wabisabi" }
 wasabi-proto = { path = "crates/wasabi-proto" }
 wallet = { path = "crates/wallet" }
+coinjoin = { path = "crates/coinjoin" }
+hw = { path = "crates/hw" }
+tokio-util = "0.7"
+rand = { workspace = true }
 bitcoin = { workspace = true }
 reqwest = { workspace = true }
 axum = "0.8"

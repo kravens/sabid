@@ -57,7 +57,8 @@ pub async fn call(ctx: &Ctx, method: &str, p: Params) -> Result<Value, RpcError>
             });
             if lw.loaded {
                 info["balance"] = json!(lw.state.balance());
-                info["coinjoinStatus"] = json!(lw.coinjoin_status);
+                let status = d.managers.read().await.get(&km.wallet_name()).map(|m| m.status().as_wasabi()).unwrap_or("Idle");
+                info["coinjoinStatus"] = json!(status);
             }
             if let Some((h, tip)) = lw.sync_progress {
                 info["syncProgress"] = json!({"height": h, "tip": tip});
@@ -84,8 +85,8 @@ pub async fn call(ctx: &Ctx, method: &str, p: Params) -> Result<Value, RpcError>
                             "index": c.outpoint.vout,
                             "amount": c.amount,
                             "anonymityScore": c.anonymity_set,
-                            "confirmed": true,
-                            "confirmations": tip.saturating_sub(c.height) + 1,
+                            "confirmed": c.height != wallet::store::MEMPOOL_HEIGHT,
+                            "confirmations": if c.height == wallet::store::MEMPOOL_HEIGHT { 0 } else { tip.saturating_sub(c.height) + 1 },
                             "keyPath": c.key_path,
                             "address": address,
                         });
@@ -110,7 +111,7 @@ pub async fn call(ctx: &Ctx, method: &str, p: Params) -> Result<Value, RpcError>
                     .map(|t| {
                         json!({
                             "datetime": chrono::DateTime::from_timestamp(t.time, 0).map(|d| d.to_rfc3339()).unwrap_or_default(),
-                            "height": t.height.to_string(),
+                            "height": if t.height == wallet::store::MEMPOOL_HEIGHT { "Mempool".to_string() } else { t.height.to_string() },
                             "amount": t.amount,
                             "label": t.labels,
                             "tx": t.txid.to_string(),
@@ -181,6 +182,26 @@ pub async fn call(ctx: &Ctx, method: &str, p: Params) -> Result<Value, RpcError>
         "getfeerates" => {
             let rates = d.fee_rates.read().await;
             Ok(Value::Object(rates.iter().map(|(k, v)| (k.to_string(), json!(v))).collect()))
+        }
+        "startcoinjoin" => {
+            let password = p.str_opt(0, "password");
+            let stop_when_all_mixed = p.bool_or(1, "stopWhenAllMixed", true);
+            let override_pleb_stop = p.bool_or(2, "overridePlebStop", true);
+            let name = ctx.wallet_name.clone().ok_or_else(|| RpcError::internal("Wallet name is invalid or not allowed."))?;
+            let w = ctx.wallet().await?;
+            if !w.lock().await.loaded {
+                return Err(RpcError::internal("Wallet is not fully synchronized yet."));
+            }
+            let m = d.manager(&name).await.map_err(RpcError::internal)?;
+            m.start(password, stop_when_all_mixed, override_pleb_stop).await.map_err(RpcError::internal)?;
+            Ok(Value::Null)
+        }
+        "stopcoinjoin" => {
+            let name = ctx.wallet_name.clone().ok_or_else(|| RpcError::internal("Wallet name is invalid or not allowed."))?;
+            if let Some(m) = d.managers.read().await.get(&name) {
+                m.stop();
+            }
+            Ok(Value::Null)
         }
         "stop" => {
             d.shutdown.notify_waiters();

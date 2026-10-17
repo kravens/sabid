@@ -164,7 +164,7 @@ impl OwnershipProof {
             // SignTaprootKeySpend(hash, merkleRoot: null, aux: zero, sighash Default) -> 64 bytes
             let kp = UntweakedKeypair::from_secret_key(&secp, secret);
             let tweaked = kp.tap_tweak(&secp, None);
-            let sig = secp.sign_schnorr_with_aux_rand(&msg, &tweaked.to_inner(), &[0u8; 32]);
+            let sig = secp.sign_schnorr_with_aux_rand(&msg, &tweaked.to_keypair(), &[0u8; 32]);
             proof.witness = vec![sig.as_ref().to_vec()];
             Ok(proof)
         } else {

@@ -19,4 +19,5 @@ bitcoin = { workspace = true }
 rand = { workspace = true }
 tracing = { workspace = true }
 bip38 = "1"
+tokio-util = "0.7"
 base64 = "0.22"

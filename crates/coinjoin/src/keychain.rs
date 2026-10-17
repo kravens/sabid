@@ -131,7 +131,7 @@ impl KeyChain for SoftKeyChain {
             let msg = Message::from_digest(sighash.to_byte_array());
             let kp = UntweakedKeypair::from_secret_key(&self.secp, &sk);
             let tweaked = kp.tap_tweak(&self.secp, None);
-            let sig = self.secp.sign_schnorr(&msg, &tweaked.to_inner());
+            let sig = self.secp.sign_schnorr(&msg, &tweaked.to_keypair());
             // Wasabi signs taproot inputs with TaprootSigHash.All: 64 bytes + 0x01.
             let mut bytes = sig.as_ref().to_vec();
             bytes.push(TapSighashType::All as u8);

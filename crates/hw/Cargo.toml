@@ -1,0 +1,17 @@
+[package]
+name = "hw"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Hardware wallet coinjoin signers: Trezor over the classic bridge HTTP API (SLIP-25, AuthorizeCoinJoin, ownership proofs, SignTx)"
+
+[dependencies]
+coinjoin = { path = "../coinjoin" }
+serde_json = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+bitcoin = { workspace = true }
+tracing = { workspace = true }

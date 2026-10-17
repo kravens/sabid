@@ -45,6 +45,7 @@ pub struct Daemon {
     pub bitcoind: Option<Bitcoind>,
     pub blocks: BlockSource,
     pub wallets: RwLock<BTreeMap<String, Arc<Mutex<LoadedWallet>>>>,
+    pub managers: RwLock<BTreeMap<String, Arc<crate::coinjoin_manager::CoinJoinManager>>>,
     pub node_height: RwLock<Option<u32>>,
     pub fee_rates: RwLock<BTreeMap<u32, u32>>,
     pub shutdown: tokio::sync::Notify,
@@ -97,6 +98,7 @@ impl Daemon {
             bitcoind,
             blocks,
             wallets: RwLock::new(BTreeMap::new()),
+            managers: RwLock::new(BTreeMap::new()),
             node_height: RwLock::new(None),
             fee_rates: RwLock::new(BTreeMap::new()),
             shutdown: tokio::sync::Notify::new(),
@@ -148,42 +150,66 @@ impl Daemon {
         self.wallets.read().await.get(name).cloned()
     }
 
-    /// Scans one wallet to the current filter tip.
+    pub async fn manager(self: &Arc<Self>, name: &str) -> anyhow::Result<Arc<crate::coinjoin_manager::CoinJoinManager>> {
+        if let Some(m) = self.managers.read().await.get(name) {
+            return Ok(m.clone());
+        }
+        let w = self.get_wallet(name).await.ok_or_else(|| anyhow::anyhow!("wallet '{name}' is not loaded"))?;
+        let m = crate::coinjoin_manager::CoinJoinManager::new(self.clone(), name, w)?;
+        self.managers.write().await.insert(name.to_string(), m.clone());
+        Ok(m)
+    }
+
+    /// Scans one wallet to the current filter tip, releasing the wallet between batches so
+    /// RPC calls keep answering during a long scan.
     pub async fn sync_wallet(self: &Arc<Self>, name: &str) -> anyhow::Result<()> {
         let Some(w) = self.get_wallet(name).await else { return Ok(()) };
-        let mut lw = w.lock().await;
-        let filters = self.filters.lock().await;
-        let report = {
-            let LoadedWallet { km, store, .. } = &mut *lw;
-            let mut last_log = std::time::Instant::now();
-            wallet::sync::scan(km, store, &filters, &self.blocks, |h, tip| {
-                if last_log.elapsed().as_secs() >= 5 {
-                    tracing::info!("{name}: scanned to {h} / {tip}");
-                    last_log = std::time::Instant::now();
-                }
-            })
-            .await
+        let tip = { self.filters.lock().await.tip_height().unwrap_or(0) };
+        let mut height = {
+            let lw = w.lock().await;
+            wallet::sync::scan_start(&lw.km, &lw.store)
         };
-        drop(filters);
-        match report {
-            Ok(r) => {
-                if r.new_txs > 0 || !lw.loaded {
-                    lw.rebuild_state()?;
+        let mut total_new = 0u32;
+        let mut last_log = std::time::Instant::now();
+        while height <= tip {
+            let mut lw = w.lock().await;
+            let filters = self.filters.lock().await;
+            let LoadedWallet { km, store, .. } = &mut *lw;
+            let result = wallet::sync::scan_batch(km, store, &filters, &self.blocks, height, 2000).await;
+            drop(filters);
+            match result {
+                Ok((next, report)) => {
+                    total_new += report.new_txs;
+                    lw.sync_progress = Some((report.to, tip));
+                    if report.new_txs > 0 {
+                        lw.rebuild_state()?;
+                        tracing::info!("{name}: {} new transactions in {} blocks ({}..{})", report.new_txs, report.matched_blocks, report.from, report.to);
+                    }
+                    if next == height {
+                        break;
+                    }
+                    height = next;
                 }
-                if r.to > 0 {
-                    lw.km.set_file_height(r.to);
-                }
-                lw.loaded = true;
-                lw.last_error = None;
-                if r.new_txs > 0 {
-                    tracing::info!("{name}: {} new transactions in {} blocks ({}..{})", r.new_txs, r.matched_blocks, r.from, r.to);
+                Err(e) => {
+                    lw.last_error = Some(e.to_string());
+                    return Err(e);
                 }
             }
-            Err(e) => {
-                lw.last_error = Some(e.to_string());
-                return Err(e);
+            if last_log.elapsed().as_secs() >= 10 {
+                tracing::info!("{name}: scanned to {} / {tip}", height - 1);
+                last_log = std::time::Instant::now();
             }
         }
+        let mut lw = w.lock().await;
+        if !lw.loaded || total_new > 0 {
+            lw.rebuild_state()?;
+        }
+        if tip > 0 {
+            lw.km.set_file_height(tip);
+        }
+        lw.loaded = true;
+        lw.sync_progress = None;
+        lw.last_error = None;
         Ok(())
     }
 
