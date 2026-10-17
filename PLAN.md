@@ -130,7 +130,8 @@ Key crates: `bitcoin` 0.32 (tx, script, bip158, psbt, taproot), `secp256k1` (sig
 - 2026-10-17 M3 code complete, not yet tested on a device: Trezor over pytrezord/trezord
   (authorize, ownership proofs, preauthorized SignTx), wired into startcoinjoin for wallets with a
   SLIP-25 account and CoinJoinVendor = Trezor.
-- Open: anonymity-score analyzer port (stub: equal-output count), mempool scanning (only the
+- 2026-10-18: BlockchainAnalyzer ported (26 of 28 coins of the synced Trezor wallet score private, as a 98-coinjoin wallet should); Trezor bridge enumerate/display/limits RPCs; MCP stdio server; bitcoind input verifier.
+- Open: mempool scanning (only the
   daemon's own coinjoins are tracked unconfirmed), remaining RPC (send/build/broadcast/payincoinjoin/
   sweep/recover/create/import/enable/displayaddress/setcoinjoinlimits), MCP server, Coldcard/
   Passport/Krux, input verification via bitcoind gettxout, pure-Rust crypto.
