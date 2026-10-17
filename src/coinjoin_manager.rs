@@ -119,8 +119,9 @@ impl DestinationProvider for WalletDestinations {
             w.km.ensure_gap();
             let want_taproot = taproot_only || prefer_taproot;
             let kind = if want_taproot { w.km.taproot_kind().unwrap_or(AccountKind::Segwit) } else { AccountKind::Segwit };
-            // Lock `count` clean internal keys of that branch (AssertLockedInternalKeysIndexedAndPersist).
-            let mut scripts = Vec::new();
+            // Wasabi hands out the wallet's locked internal keys (left over from earlier rounds) and
+            // locks clean ones only when there are not enough (AssertLockedInternalKeysIndexedAndPersist).
+            let mut scripts: Vec<ScriptBuf> = w.km.keys.iter().filter(|k| k.kind == kind && k.is_internal && k.state == KeyState::Locked).map(|k| k.script.clone()).collect();
             for k in w.km.keys.iter_mut().filter(|k| k.kind == kind && k.is_internal && k.state == KeyState::Clean) {
                 if scripts.len() >= count {
                     break;
@@ -128,6 +129,7 @@ impl DestinationProvider for WalletDestinations {
                 k.state = KeyState::Locked;
                 scripts.push(k.script.clone());
             }
+            scripts.truncate(count.max(scripts.len().min(count)));
             w.km.ensure_gap();
             w.km.save().ok();
             scripts
@@ -499,7 +501,10 @@ impl CoinJoinManager {
                 tracing::info!("{}: coinjoin round failed, will retry.", self.wallet_name);
                 Ok(true)
             }
-            Err(CjError::Cancelled) => Ok(false),
+            Err(CjError::Cancelled) => {
+                // The user's stop cancels the parent token; a round timeout only cancels a child.
+                Ok(!cancel.is_cancelled() && self.cancel.lock().unwrap().as_ref().map(|c| !c.is_cancelled()).unwrap_or(false))
+            }
             Err(CjError::UnknownRoundEnding { coins, output_scripts, msg }) => {
                 tracing::warn!("{}: round ending unknown: {msg}", self.wallet_name);
                 let mut w = self.wallet.lock().await;
