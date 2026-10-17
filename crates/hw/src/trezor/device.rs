@@ -9,6 +9,16 @@ use tokio::sync::Mutex;
 
 const MIN_FIRMWARE: (u32, u32, u32) = (2, 7, 2);
 
+#[derive(Debug, Clone)]
+pub struct DeviceInfo {
+    pub path: String,
+    pub model: String,
+    pub firmware: String,
+    pub fingerprint: String,
+    pub passphrase_protection: bool,
+    pub error: Option<String>,
+}
+
 pub struct TrezorDevice {
     transport: BridgeTransport,
     session: String,
@@ -87,6 +97,46 @@ impl TrezorDevice {
             None => format!("No Trezor device with master fingerprint '{}' found.{hint}", master_fingerprint.unwrap_or("")),
             Some(e) => format!("No usable Trezor device found. Last error: {e}"),
         }))
+    }
+
+    /// Every Trezor the bridge lists, opened briefly for its features and fingerprint (standard wallet).
+    pub async fn enumerate() -> Result<Vec<DeviceInfo>, TrezorError> {
+        let mut found = None;
+        let mut error = String::new();
+        for uri in DEFAULT_BRIDGE_URIS {
+            let t = BridgeTransport::new(uri)?;
+            match tokio::time::timeout(Duration::from_secs(5), t.enumerate()).await {
+                Ok(Ok(devices)) => {
+                    found = Some((t, devices));
+                    break;
+                }
+                Ok(Err(e)) => error = e.0,
+                Err(_) => error = format!("{uri} did not answer"),
+            }
+        }
+        let Some((transport, devices)) = found else { return Err(TrezorError(format!("Trezor Bridge is not running. ({error})"))) };
+        let mut out = Vec::new();
+        for bd in &devices {
+            let mut device = TrezorDevice { transport: transport.clone(), session: String::new(), use_on_device_passphrase: false, features: None, lock: Mutex::new(()) };
+            let mut info = DeviceInfo { path: bd.path.clone(), model: String::new(), firmware: String::new(), fingerprint: String::new(), passphrase_protection: false, error: None };
+            match device.open(bd).await {
+                Ok(()) => {
+                    if let Some(f) = &device.features {
+                        info.model = f.model.clone();
+                        info.firmware = format!("{}.{}.{}", f.major, f.minor, f.patch);
+                        info.passphrase_protection = f.passphrase_protection;
+                    }
+                    match device.master_fingerprint().await {
+                        Ok(fp) => info.fingerprint = fp,
+                        Err(e) => info.error = Some(e.0),
+                    }
+                }
+                Err(e) => info.error = Some(e.0),
+            }
+            device.release().await;
+            out.push(info);
+        }
+        Ok(out)
     }
 
     async fn open(&mut self, bd: &BridgeDevice) -> Result<(), TrezorError> {

@@ -412,7 +412,35 @@ impl CoinJoinManager {
                 allow_solo_coinjoining: false,
             },
             liquidity_clue: self.liquidity_clue.clone(),
-            input_verifier: None,
+            input_verifier: d.bitcoind.clone().map(|node| {
+                let f: coinjoin::client::InputVerifier = Arc::new(move |coins: Vec<coinjoin::client::ForeignCoin>| {
+                    let node = node.clone();
+                    Box::pin(async move {
+                        // Wasabi `InputVerifiers.CreateRpcVerifier`: check a random 10% sample (at least one).
+                        if coins.is_empty() {
+                            return Ok(());
+                        }
+                        let mut sample = coins.clone();
+                        {
+                            use rand::seq::SliceRandom;
+                            sample.shuffle(&mut rand::thread_rng());
+                        }
+                        let n = ((coins.len() as f64) * 0.10).floor().max(1.0) as usize;
+                        sample.truncate(n);
+                        let outpoints: Vec<bitcoin::OutPoint> = sample.iter().map(|c| c.outpoint).collect();
+                        let found = node.get_tx_outs(&outpoints).await.map_err(|e| format!("gettxout failed: {e}"))?;
+                        for (c, spk) in sample.iter().zip(found) {
+                            match spk {
+                                None => return Err(format!("UTXO {} does not exist or is already spent. The coordinator may be malicious.", c.outpoint)),
+                                Some(s) if s != c.script => return Err(format!("ScriptPubKey mismatch for {}. The coordinator may be malicious.", c.outpoint)),
+                                _ => {}
+                            }
+                        }
+                        Ok(())
+                    })
+                });
+                f
+            }),
             do_not_register_in_last_minute: std::time::Duration::from_secs(60),
             min_anon_score_for_payments: if only_private_payments { anon_target } else { 0 },
             progress: tx,

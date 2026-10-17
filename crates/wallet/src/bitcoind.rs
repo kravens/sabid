@@ -138,6 +138,19 @@ impl Bitcoind {
         v.as_str().and_then(|s| s.parse().ok()).ok_or_else(|| RpcError::Bad("sendrawtransaction".into()))
     }
 
+    /// `gettxout` for many outpoints in one round trip: the scriptPubKey of each unspent one.
+    pub async fn get_tx_outs(&self, outpoints: &[bitcoin::OutPoint]) -> Result<Vec<Option<bitcoin::ScriptBuf>>, RpcError> {
+        let calls: Vec<(&str, Value)> = outpoints.iter().map(|o| ("gettxout", json!([o.txid.to_string(), o.vout, true]))).collect();
+        let results = self.batch(&calls).await?;
+        let mut out = Vec::with_capacity(results.len());
+        for r in results {
+            let v = r?;
+            let spk = v.get("scriptPubKey").and_then(|s| s.get("hex")).and_then(Value::as_str).and_then(|h| hex::decode(h).ok()).map(bitcoin::ScriptBuf::from_bytes);
+            out.push(spk);
+        }
+        Ok(out)
+    }
+
     /// sat/vB for a confirmation target, if the node has an estimate.
     pub async fn estimate_fee(&self, target: u32) -> Result<Option<f64>, RpcError> {
         let v = self.call("estimatesmartfee", json!([target, "ECONOMICAL"])).await?;

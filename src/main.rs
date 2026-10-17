@@ -1,6 +1,7 @@
 mod coinjoin_manager;
 mod config;
 mod daemon;
+mod mcp;
 mod methods;
 mod rpc;
 mod tor;
@@ -50,6 +51,12 @@ enum Cmd {
         /// Wallet directory (default: ~/.walletwasabi/client/Wallets, shared with Wasabi)
         #[arg(long)]
         wallet_dir: Option<PathBuf>,
+    },
+    /// Model Context Protocol server on stdio for agents (thin client of a running daemon)
+    Mcp {
+        /// RPC URL of the daemon (default: from Config.json)
+        #[arg(long)]
+        url: Option<String>,
     },
     /// Call a JSON-RPC method on a running daemon (sabid or Wasabi)
     Rpc {
@@ -135,6 +142,11 @@ async fn main() -> anyhow::Result<()> {
             }
             sync.abort();
             drop(tor_handle);
+        }
+        Cmd::Mcp { url } => {
+            let base = url.unwrap_or_else(|| cfg.json_rpc_server_prefixes.first().cloned().unwrap_or_else(|| "http://127.0.0.1:37128/".into()));
+            let client = mcp::McpClient { base, user: cfg.json_rpc_user.clone(), password: cfg.json_rpc_password.clone() };
+            client.serve_stdio().await?;
         }
         Cmd::Rpc { method, params, wallet, url } => {
             let base = url.unwrap_or_else(|| cfg.json_rpc_server_prefixes.first().cloned().unwrap_or_else(|| "http://127.0.0.1:37128/".into()));

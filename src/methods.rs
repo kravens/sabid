@@ -203,6 +203,76 @@ pub async fn call(ctx: &Ctx, method: &str, p: Params) -> Result<Value, RpcError>
             }
             Ok(Value::Null)
         }
+        "enumeratedevices" => {
+            let devices = hw::TrezorDevice::enumerate().await.map_err(|e| RpcError::internal(e.0))?;
+            Ok(Value::Array(
+                devices
+                    .into_iter()
+                    .map(|dv| {
+                        json!({
+                            "model": if dv.model.is_empty() { "Trezor".to_string() } else { format!("Trezor {}", dv.model) },
+                            "masterKeyFingerprint": dv.fingerprint,
+                            "initialized": dv.error.is_none(),
+                            "canSignCoinJoins": true,
+                            "vendor": "Trezor",
+                            "needsPin": false,
+                            "needsPassphrase": dv.passphrase_protection,
+                            "firmware": dv.firmware,
+                            "path": dv.path,
+                            "error": dv.error.unwrap_or_default(),
+                        })
+                    })
+                    .collect(),
+            ))
+        }
+        "setcoinjoinlimits" => {
+            let w = ctx.wallet().await?;
+            let mut lw = w.lock().await;
+            if let Some(v) = p.get(0, "maxRounds").and_then(Value::as_i64) {
+                lw.km.set_field("CoinJoinDeviceMaxRounds", json!(v));
+            }
+            if let Some(v) = p.get(1, "maxMiningFeeRate").and_then(Value::as_f64) {
+                lw.km.set_field("CoinJoinDeviceMaxMiningFeeRate", json!(v));
+            }
+            if let Some(v) = p.get(2, "maxSatsLeaving").and_then(Value::as_i64) {
+                lw.km.set_field("ColdcardMaxSatsLeaving", json!(v));
+            }
+            if let Some(v) = p.get(3, "maxTransactionsPerPeriod").and_then(Value::as_i64) {
+                lw.km.set_field("ColdcardMaxTransactionsPerPeriod", json!(v));
+            }
+            if let Some(v) = p.get(4, "minRoundInputs").and_then(Value::as_i64) {
+                lw.km.set_field("ColdcardMinInputs", json!(v));
+            }
+            lw.km.save().map_err(RpcError::internal)?;
+            Ok(json!({
+                "maxRounds": lw.km.i64_field("CoinJoinDeviceMaxRounds", 50),
+                "maxMiningFeeRate": lw.km.f64_field("CoinJoinDeviceMaxMiningFeeRate", 5.0),
+                "maxSatsLeaving": lw.km.i64_field("ColdcardMaxSatsLeaving", 100000),
+                "maxTransactionsPerPeriod": lw.km.i64_field("ColdcardMaxTransactionsPerPeriod", 6),
+                "minRoundInputs": lw.km.i64_field("ColdcardMinInputs", 21),
+                "appliesFromNextAuthorization": true
+            }))
+        }
+        "displayaddress" => {
+            let address = p.str(0, "address")?;
+            let w = ctx.wallet().await?;
+            let (fingerprint, network, key) = {
+                let lw = w.lock().await;
+                let addr: bitcoin::Address = address.parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>().map_err(|_| RpcError::invalid_params("address"))?.assume_checked();
+                let key = lw.km.key_for_script(&addr.script_pubkey()).ok_or_else(|| RpcError::internal("The address does not belong to this wallet."))?.clone();
+                if !lw.km.is_hardware_wallet() {
+                    return Err(RpcError::internal("This is not a hardware wallet."));
+                }
+                (lw.km.master_fingerprint(), lw.km.network(), key)
+            };
+            let device = hw::TrezorDevice::find(Some(&fingerprint)).await.map_err(|e| RpcError::internal(e.0))?;
+            let n = hw::trezor::messages::address_n(&key.path).ok_or_else(|| RpcError::internal("bad key path"))?;
+            let shown = device.show_address(&n, network).await.map_err(|e| RpcError::internal(e.0))?;
+            if !shown.eq_ignore_ascii_case(&address) {
+                return Err(RpcError::internal(format!("The device showed a different address ({shown}).")));
+            }
+            Ok(json!({"address": address, "keyPath": key.path, "verified": true}))
+        }
         "stop" => {
             d.shutdown.notify_waiters();
             Ok(Value::Null)

@@ -11,5 +11,5 @@ pub mod trezor {
 }
 
 pub use trezor::bridge::TrezorError;
-pub use trezor::device::TrezorDevice;
+pub use trezor::device::{DeviceInfo, TrezorDevice};
 pub use trezor::keychain::TrezorKeyChain;
