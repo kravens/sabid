@@ -1137,6 +1137,48 @@ mod tests {
     }
 
     #[test]
+    fn unsigned_coinjoin_matches_wasabi_ordering() {
+        // SigningState.SortedInputs: amount desc, then outpoint bytes; SortedOutputs: per script, value desc, then script bytes.
+        let spk_a = "0 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let spk_b = "1 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let proof = hex::encode([0u8; 4]);
+        let outpoint = |b: u8, vout: u32| -> String {
+            let mut v = vec![b; 32];
+            v.extend_from_slice(&vout.to_le_bytes());
+            hex::encode_upper(v)
+        };
+        let json = serde_json::json!({
+            "id": "00".repeat(32), "blameOf": "00".repeat(32),
+            "amountCredentialIssuerParameters": {"cw": "02".repeat(33)[..66], "i": "02".repeat(33)[..66]},
+            "vsizeCredentialIssuerParameters": {"cw": "02".repeat(33)[..66], "i": "02".repeat(33)[..66]},
+            "phase": 3, "endRoundState": 0, "inputRegistrationStart": "2026-10-17T20:07:52.3679128+00:00", "inputRegistrationTimeout": "0d 0h 21m 0s",
+            "coinjoinState": {"Type": "SigningState", "Witnesses": {}, "IsFullySigned": false, "Events": [
+                {"Type": "RoundCreated", "RoundParameters": {"Network": "Main", "MiningFeeRate": 500, "MaxSuggestedAmount": 1, "MinInputCountByRound": 1, "MaxInputCountByRound": 9,
+                    "AllowedInputAmounts": {"Min": 1, "Max": 9}, "AllowedOutputAmounts": {"Min": 1, "Max": 9}, "AllowedInputTypes": [4, 7], "AllowedOutputTypes": [4, 7],
+                    "StandardInputRegistrationTimeout": "0d 0h 1m 0s", "ConnectionConfirmationTimeout": "0d 0h 1m 0s", "OutputRegistrationTimeout": "0d 0h 1m 0s", "TransactionSigningTimeout": "0d 0h 1m 0s",
+                    "BlameInputRegistrationTimeout": "0d 0h 1m 0s", "MinAmountCredentialValue": 1, "MaxAmountCredentialValue": 9, "MaxVsizeAllocationPerAlice": 255, "CoordinationIdentifier": "x", "DelayTransactionSigning": false}},
+                {"Type": "InputAdded", "Coin": {"Outpoint": outpoint(0x11, 1), "TxOut": {"ScriptPubKey": spk_a, "Value": 5000}}, "OwnershipProof": proof},
+                {"Type": "InputAdded", "Coin": {"Outpoint": outpoint(0x22, 0), "TxOut": {"ScriptPubKey": spk_b, "Value": 7000}}, "OwnershipProof": proof},
+                {"Type": "InputAdded", "Coin": {"Outpoint": outpoint(0x11, 0), "TxOut": {"ScriptPubKey": spk_a, "Value": 5000}}, "OwnershipProof": proof},
+                {"Type": "OutputAdded", "Output": {"ScriptPubKey": spk_a, "Value": 3000}},
+                {"Type": "OutputAdded", "Output": {"ScriptPubKey": spk_b, "Value": 8000}},
+                {"Type": "OutputAdded", "Output": {"ScriptPubKey": spk_a, "Value": 2000}}
+            ]}
+        });
+        let round: RoundState = serde_json::from_value(json).unwrap();
+        let u = build_unsigned_coinjoin(&round).unwrap();
+        assert_eq!(u.tx.version, Version::ONE);
+        assert_eq!(u.tx.input.len(), 3);
+        assert_eq!(u.prevouts[0].value.to_sat(), 7000);
+        assert_eq!(u.tx.input[1].previous_output.vout, 0, "same txid: lower vout bytes first");
+        assert_eq!(u.tx.input[2].previous_output.vout, 1);
+        assert_eq!(u.tx.output.len(), 2, "outputs to the same script are merged");
+        assert_eq!(u.tx.output[0].value.to_sat(), 8000);
+        assert_eq!(u.tx.output[1].value.to_sat(), 5000);
+        assert!(u.tx.input.iter().all(|i| i.sequence == Sequence::MAX));
+    }
+
+    #[test]
     fn scheduled_instants_are_sorted_and_capped() {
         let now = Instant::now();
         let d = scheduled_instants(5, now, now + Duration::from_secs(100), Duration::from_secs(10));

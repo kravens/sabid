@@ -16,6 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const MAINNET_ONION_PEERS: &str = include_str!("../../../vendor/onion_peers_main.txt");
+const MAINNET_IPV4_PEERS: &str = include_str!("../../../vendor/ipv4_peers_main.txt");
 
 pub struct P2pBlockFetcher {
     socks: String,
@@ -27,8 +28,9 @@ pub struct P2pBlockFetcher {
 
 impl P2pBlockFetcher {
     pub fn new(socks: &str, network: Network) -> Self {
+        // Onion peers first (no exit needed), clearnet peers reached through Tor exits as a fallback.
         let peers = match network {
-            Network::Bitcoin => MAINNET_ONION_PEERS.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect(),
+            Network::Bitcoin => MAINNET_ONION_PEERS.lines().chain(MAINNET_IPV4_PEERS.lines()).map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect(),
             _ => Vec::new(),
         };
         Self { socks: socks.to_string(), peers, magic: Magic::from(network), good: std::sync::Mutex::new(Vec::new()) }
@@ -41,9 +43,13 @@ impl P2pBlockFetcher {
     /// Tries known-good peers first, then random ones, three at a time (first block wins).
     pub async fn get_block(&self, hash: &BlockHash, attempts: usize) -> anyhow::Result<Block> {
         let mut candidates: Vec<String> = self.good.lock().unwrap().clone();
-        let mut rest: Vec<String> = self.peers.iter().filter(|p| !candidates.contains(p)).cloned().collect();
-        rest.shuffle(&mut rand::thread_rng());
-        candidates.extend(rest);
+        let mut onions: Vec<String> = self.peers.iter().filter(|p| !candidates.contains(p) && p.contains(".onion")).cloned().collect();
+        let mut clearnet: Vec<String> = self.peers.iter().filter(|p| !candidates.contains(p) && !p.contains(".onion")).cloned().collect();
+        onions.shuffle(&mut rand::thread_rng());
+        clearnet.shuffle(&mut rand::thread_rng());
+        onions.truncate(attempts.max(3) / 2);
+        candidates.extend(onions);
+        candidates.extend(clearnet);
         candidates.truncate(attempts.max(3));
         let mut last = anyhow::anyhow!("no peers");
         for chunk in candidates.chunks(3) {
