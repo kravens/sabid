@@ -124,6 +124,9 @@ impl Bitcoind {
         // A multi-megabyte body over a Tor stream fails now and then; the second try uses a fresh connection.
         let mut last = RpcError::Bad("getblock".into());
         for attempt in 0..3 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_secs(5 * attempt as u64)).await;
+            }
             let client = if attempt == 0 { self.clone() } else { self.fresh()? };
             match client.call("getblock", json!([hash.to_string(), 0])).await {
                 Ok(v) => {
@@ -136,11 +139,14 @@ impl Bitcoind {
         Err(last)
     }
 
-    /// Same endpoint, a new client without pooled connections.
+    /// Same endpoint, a new client without pooled connections and (through Tor) a new circuit:
+    /// the SOCKS username selects the circuit, so a torn-down onion circuit is not reused.
     fn fresh(&self) -> Result<Self, RpcError> {
         let mut b = reqwest::Client::builder().timeout(Duration::from_secs(300)).connect_timeout(Duration::from_secs(60)).pool_max_idle_per_host(0);
         if let Some(p) = &self.proxy {
-            b = b.proxy(reqwest::Proxy::all(p.clone())?);
+            let nonce: u32 = rand::random();
+            let p = p.replace("sabid-bitcoind:", &format!("sabid-bitcoind-{nonce:08x}:"));
+            b = b.proxy(reqwest::Proxy::all(p)?);
         }
         Ok(Self { url: self.url.clone(), auth: self.auth.clone(), http: b.build()?, proxy: self.proxy.clone() })
     }
