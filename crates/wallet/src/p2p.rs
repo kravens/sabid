@@ -1,7 +1,7 @@
 //! Block download from random onion peers over Tor (what Wasabi's P2P block provider does),
 //! for blocks that are neither cached nor obtainable from the user's node.
 
-use bitcoin::consensus::encode::{deserialize, serialize};
+use bitcoin::consensus::encode::{deserialize_partial, serialize};
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
 use bitcoin::p2p::message_blockdata::Inventory;
@@ -100,7 +100,8 @@ async fn read_msg(stream: &mut TcpStream) -> anyhow::Result<NetworkMessage> {
     buf.extend_from_slice(&header);
     buf.resize(24 + len, 0);
     stream.read_exact(&mut buf[24..]).await?;
-    let raw: RawNetworkMessage = deserialize(&buf)?;
+    // Some peers pad messages (version with extra fields, addrv2 variants): take what decodes.
+    let (raw, _consumed): (RawNetworkMessage, usize) = deserialize_partial(&buf)?;
     Ok(raw.into_payload())
 }
 

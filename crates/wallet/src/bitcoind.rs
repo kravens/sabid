@@ -21,6 +21,7 @@ pub struct Bitcoind {
     url: String,
     auth: Option<(String, String)>,
     http: reqwest::Client,
+    proxy: Option<String>,
 }
 
 impl Bitcoind {
@@ -33,14 +34,17 @@ impl Bitcoind {
         } else {
             credentials.split_once(':').map(|(u, p)| (u.to_string(), p.to_string()))
         };
-        let mut b = reqwest::Client::builder().timeout(Duration::from_secs(180)).connect_timeout(Duration::from_secs(60));
+        let mut b = reqwest::Client::builder().timeout(Duration::from_secs(300)).connect_timeout(Duration::from_secs(60));
         let is_onion = url.contains(".onion");
+        let mut proxy = None;
         if let Some(s) = socks5 {
             if is_onion || !url.contains("127.0.0.1") && !url.contains("localhost") {
-                b = b.proxy(reqwest::Proxy::all(format!("socks5h://sabid-bitcoind:x@{s}"))?);
+                let p = format!("socks5h://sabid-bitcoind:x@{s}");
+                b = b.proxy(reqwest::Proxy::all(p.clone())?);
+                proxy = Some(p);
             }
         }
-        Ok(Self { url, auth, http: b.build()? })
+        Ok(Self { url, auth, http: b.build()?, proxy })
     }
 
     pub fn endpoint(&self) -> &str {
@@ -117,9 +121,28 @@ impl Bitcoind {
     }
 
     pub async fn get_block(&self, hash: &BlockHash) -> Result<Block, RpcError> {
-        let v = self.call("getblock", json!([hash.to_string(), 0])).await?;
-        let raw = hex::decode(v.as_str().unwrap_or("")).map_err(|_| RpcError::Bad("block hex".into()))?;
-        deserialize(&raw).map_err(|e| RpcError::Bad(format!("block: {e}")))
+        // A multi-megabyte body over a Tor stream fails now and then; the second try uses a fresh connection.
+        let mut last = RpcError::Bad("getblock".into());
+        for attempt in 0..3 {
+            let client = if attempt == 0 { self.clone() } else { self.fresh()? };
+            match client.call("getblock", json!([hash.to_string(), 0])).await {
+                Ok(v) => {
+                    let raw = hex::decode(v.as_str().unwrap_or("")).map_err(|_| RpcError::Bad("block hex".into()))?;
+                    return deserialize(&raw).map_err(|e| RpcError::Bad(format!("block: {e}")));
+                }
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    }
+
+    /// Same endpoint, a new client without pooled connections.
+    fn fresh(&self) -> Result<Self, RpcError> {
+        let mut b = reqwest::Client::builder().timeout(Duration::from_secs(300)).connect_timeout(Duration::from_secs(60)).pool_max_idle_per_host(0);
+        if let Some(p) = &self.proxy {
+            b = b.proxy(reqwest::Proxy::all(p.clone())?);
+        }
+        Ok(Self { url: self.url.clone(), auth: self.auth.clone(), http: b.build()?, proxy: self.proxy.clone() })
     }
 
     pub async fn get_block_header_time(&self, hash: &BlockHash) -> Result<i64, RpcError> {
