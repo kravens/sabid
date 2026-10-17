@@ -21,6 +21,8 @@ pub struct P2pBlockFetcher {
     socks: String,
     peers: Vec<String>,
     magic: Magic,
+    /// Peers that served a block before; many seed onions are stale, so these go first.
+    good: std::sync::Mutex<Vec<String>>,
 }
 
 impl P2pBlockFetcher {
@@ -29,32 +31,55 @@ impl P2pBlockFetcher {
             Network::Bitcoin => MAINNET_ONION_PEERS.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect(),
             _ => Vec::new(),
         };
-        Self { socks: socks.to_string(), peers, magic: Magic::from(network) }
+        Self { socks: socks.to_string(), peers, magic: Magic::from(network), good: std::sync::Mutex::new(Vec::new()) }
     }
 
     pub fn has_peers(&self) -> bool {
         !self.peers.is_empty()
     }
 
-    /// Tries up to `attempts` random peers, a fresh Tor circuit each.
+    /// Tries known-good peers first, then random ones, three at a time (first block wins).
     pub async fn get_block(&self, hash: &BlockHash, attempts: usize) -> anyhow::Result<Block> {
-        let mut peers = self.peers.clone();
-        peers.shuffle(&mut rand::thread_rng());
+        let mut candidates: Vec<String> = self.good.lock().unwrap().clone();
+        let mut rest: Vec<String> = self.peers.iter().filter(|p| !candidates.contains(p)).cloned().collect();
+        rest.shuffle(&mut rand::thread_rng());
+        candidates.extend(rest);
+        candidates.truncate(attempts.max(3));
         let mut last = anyhow::anyhow!("no peers");
-        for peer in peers.iter().take(attempts) {
-            match tokio::time::timeout(Duration::from_secs(120), fetch_from_peer(&self.socks, peer, self.magic, hash)).await {
-                Ok(Ok(b)) => return Ok(b),
-                Ok(Err(e)) => {
-                    tracing::debug!("p2p {peer}: {e}");
-                    last = e;
-                }
-                Err(_) => {
-                    tracing::debug!("p2p {peer}: timeout");
-                    last = anyhow::anyhow!("timeout");
+        for chunk in candidates.chunks(3) {
+            let mut set = tokio::task::JoinSet::new();
+            for peer in chunk {
+                let (socks, peer, magic, hash) = (self.socks.clone(), peer.clone(), self.magic, *hash);
+                set.spawn(async move {
+                    let r = tokio::time::timeout(Duration::from_secs(120), fetch_from_peer(&socks, &peer, magic, &hash)).await;
+                    (peer, r)
+                });
+            }
+            while let Some(joined) = set.join_next().await {
+                match joined {
+                    Ok((peer, Ok(Ok(b)))) => {
+                        let mut good = self.good.lock().unwrap();
+                        if !good.contains(&peer) {
+                            good.push(peer);
+                        }
+                        set.abort_all();
+                        return Ok(b);
+                    }
+                    Ok((peer, Ok(Err(e)))) => {
+                        tracing::debug!("p2p {peer}: {e}");
+                        self.good.lock().unwrap().retain(|p| p != &peer);
+                        last = e;
+                    }
+                    Ok((peer, Err(_))) => {
+                        tracing::debug!("p2p {peer}: timeout");
+                        self.good.lock().unwrap().retain(|p| p != &peer);
+                        last = anyhow::anyhow!("timeout");
+                    }
+                    Err(e) => last = anyhow::anyhow!("{e}"),
                 }
             }
         }
-        Err(anyhow::anyhow!("block {hash} not obtained from {attempts} peers: {last}"))
+        Err(anyhow::anyhow!("block {hash} not obtained from {} peers: {last}", candidates.len()))
     }
 }
 

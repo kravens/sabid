@@ -35,13 +35,13 @@ impl BlockSource {
             match node.get_block(hash).await {
                 Ok(b) => return Ok(self.cache(b)),
                 Err(e) => {
-                    tracing::debug!("bitcoind getblock {name}: {e}");
+                    tracing::warn!("bitcoind getblock {name}: {e}; trying P2P peers");
                     last_err = e.into();
                 }
             }
         }
         if let Some(p2p) = &self.p2p {
-            match p2p.get_block(hash, 6).await {
+            match p2p.get_block(hash, 12).await {
                 Ok(b) => return Ok(self.cache(b)),
                 Err(e) => last_err = e,
             }
