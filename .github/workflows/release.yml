@@ -1,7 +1,7 @@
 name: release
 # A tag v* builds the Linux x86_64 binary, packages it with the docs and the regtest smoke test,
-# writes SHA256SUMS, signs it with the release key when the SABID_SIGNING_KEY secret exists
-# (secp256k1 EC private key, PEM; see README "Releases"), and publishes a pre-release.
+# writes SHA256SUMS, signs it with the maintainer's PGP key when the SIGNING_PGP_KEY secret exists
+# (else the maintainer signs by hand, see README "Releases"), and publishes a pre-release.
 on:
   push:
     tags: ["v*"]
@@ -13,6 +13,8 @@ permissions:
 jobs:
   linux-x64:
     runs-on: ubuntu-22.04
+    env:
+      HAS_SIGNING_KEY: ${{ secrets.SIGNING_PGP_KEY != '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -31,18 +33,15 @@ jobs:
           tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
           (cd dist && sha256sum "$NAME.tar.gz" > SHA256SUMS)
           cat dist/SHA256SUMS
+      - name: import the release PGP key
+        if: env.HAS_SIGNING_KEY == 'true'
+        uses: crazy-max/ghaction-import-gpg@2dc316deee8e90f13e1a351ab510b4d5bc0c82cd # v7.0.0
+        with:
+          gpg_private_key: ${{ secrets.SIGNING_PGP_KEY }}
+          passphrase: ${{ secrets.SIGNING_PGP_PASSPHRASE }}
       - name: sign SHA256SUMS
-        if: ${{ env.SABID_SIGNING_KEY != '' }}
-        env:
-          SABID_SIGNING_KEY: ${{ secrets.SABID_SIGNING_KEY }}
-        run: |
-          set -eu
-          umask 077
-          printf '%s\n' "$SABID_SIGNING_KEY" > key.pem
-          openssl dgst -sha256 -sign key.pem dist/SHA256SUMS | base64 -w0 > dist/SHA256SUMS.sabidsig
-          openssl ec -in key.pem -pubout -conv_form compressed -outform DER 2>/dev/null | tail -c 33 | od -An -tx1 | tr -d ' \n' > dist/release-key.hex
-          rm -f key.pem
-          echo "signed with key $(cat dist/release-key.hex)"
+        if: env.HAS_SIGNING_KEY == 'true'
+        run: gpg --batch --yes --detach-sign --output dist/SHA256SUMS.sig dist/SHA256SUMS && gpg --verify dist/SHA256SUMS.sig dist/SHA256SUMS
       - name: publish
         uses: softprops/action-gh-release@v2
         with:
@@ -50,5 +49,4 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/SHA256SUMS
-            dist/SHA256SUMS.sabidsig
-            dist/release-key.hex
+            dist/SHA256SUMS.sig

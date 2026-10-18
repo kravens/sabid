@@ -233,20 +233,21 @@ Ideas on the table, none implemented yet; each gets a design section in `PLAN.md
 
 ## Releases
 
-A tag `v*` makes the `release` workflow build `sabid-<tag>-linux-x64.tar.gz`, write
-`SHA256SUMS`, sign it when the `SABID_SIGNING_KEY` repository secret holds the release key, and
-publish a pre-release. The signature is a secp256k1 ECDSA signature (DER, base64) over
-`SHA256(SHA256SUMS)`, the same scheme Wasabi uses for `SHA256SUMS.wasabisig`, so sabi.py can
-verify it with its pure-Python verifier against a pinned public key.
+A tag `v*` makes the `release` workflow build `sabid-<tag>-linux-x64.tar.gz`, write `SHA256SUMS`
+and publish a pre-release. `SHA256SUMS` is signed with the maintainer's OpenPGP key
+(`2536F69E 9C372566 2B6C146B DCF17F7A 01272020`, the key that also signs the Wasabi preview
+releases), either by the workflow when the `SIGNING_PGP_KEY` / `SIGNING_PGP_PASSPHRASE` secrets
+exist, or by hand:
 
 ```sh
-openssl ecparam -name secp256k1 -genkey -noout -out sabid-release-key.pem   # keep it offline too
-openssl ec -in sabid-release-key.pem -pubout -conv_form compressed -outform DER | tail -c 33 | od -An -tx1 | tr -d ' \n'
+gh release download v0.1.0 -p SHA256SUMS
+gpg --detach-sign SHA256SUMS              # SHA256SUMS.sig
+gh release upload v0.1.0 SHA256SUMS.sig
 ```
 
-The second command prints the 33-byte public key to pin (`SABID_RELEASE_PUBKEY` in sabi.py); the
-PEM goes into the `SABID_SIGNING_KEY` secret. Until a signed release exists, sabi.py refuses to
-install sabid and says so.
+sabi.py verifies that signature in pure Python (an Ed25519 OpenPGP verifier, no gpg needed)
+against the pinned key before it installs a release, then checks the archive's sha256 against the
+signed list. Anyone else: `gpg --verify SHA256SUMS.sig SHA256SUMS && sha256sum -c SHA256SUMS`.
 
 ## Layout
 
