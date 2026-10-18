@@ -288,7 +288,7 @@ impl TrezorDevice {
             return false;
         }
         let _g = self.lock.lock().await;
-        matches!(self.transport.call(&self.session, &msg::get_features()).await, Ok(m) if m.kind == MessageType::Features)
+        matches!(tokio::time::timeout(Duration::from_secs(5), self.transport.call(&self.session, &msg::get_features())).await, Ok(Ok(m)) if m.kind == MessageType::Features)
     }
 }
 

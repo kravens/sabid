@@ -18,7 +18,6 @@ pub struct LoadedWallet {
     /// Synced to the filter tip at least once.
     pub loaded: bool,
     pub sync_progress: Option<(u32, u32)>,
-    pub coinjoin_status: &'static str,
     pub last_error: Option<String>,
 }
 
@@ -135,7 +134,7 @@ impl Daemon {
             anyhow::bail!("wallet '{name}' is for {:?}, daemon runs {:?}", km.network(), self.network);
         }
         let store = WalletStore::open(&self.datadir.join(network_dir_name(self.network)).join(format!("{name}.sqlite")))?;
-        let mut lw = LoadedWallet { km, store, state: WalletState::default(), loaded: false, sync_progress: None, coinjoin_status: "Idle", last_error: None };
+        let mut lw = LoadedWallet { km, store, state: WalletState::default(), loaded: false, sync_progress: None, last_error: None };
         lw.rebuild_state()?;
         let w = Arc::new(Mutex::new(lw));
         self.wallets.write().await.insert(name.to_string(), w.clone());
@@ -251,8 +250,15 @@ impl Daemon {
                 let node_hash = node.get_block_hash(t.height).await?;
                 if node_hash != ph {
                     tracing::warn!("reorg at {}: rolling back own filters", t.height);
-                    let f = self.filters.lock().await;
-                    f.rollback_own_above(t.height - 1)?;
+                    // Filters first, released before any wallet lock (RPC handlers lock wallet then filters).
+                    let after = {
+                        let f = self.filters.lock().await;
+                        f.rollback_own_above(t.height - 1)?;
+                        f.tip()
+                    };
+                    if after.as_ref().map(|a| a.block_hash) == Some(ph) {
+                        anyhow::bail!("reorg at {} reaches into Wasabi's read-only filter store; let Wasabi repair it", t.height);
+                    }
                     for w in self.wallets.read().await.values() {
                         let lw = w.lock().await;
                         lw.store.rollback_above(t.height - 1)?;

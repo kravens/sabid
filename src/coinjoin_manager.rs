@@ -556,10 +556,10 @@ impl CoinJoinManager {
             }
         };
         let result = client.start_coin_join(candidates_fn, cancel.clone()).await;
-        drop(client);
-        progress_task.abort();
+        drop(client); // closes the progress channel, so the task drains the last events and ends
+        let _ = progress_task.await;
         match result {
-            Ok(CoinJoinResult::Success { coins, output_scripts, unsigned_tx, costs }) => {
+            Ok(CoinJoinResult::Success { output_scripts, unsigned_tx, costs, .. }) => {
                 tracing::info!("{}: coinjoin finished, transaction {} was broadcast (mining fee {} sat, dust {} sat)", self.wallet_name, unsigned_tx.compute_txid(), costs.mining_fee, costs.wasted_dust);
                 let mut w = self.wallet.lock().await;
                 for s in &output_scripts {
@@ -567,7 +567,6 @@ impl CoinJoinManager {
                         k.state = KeyState::Used;
                     }
                 }
-                let _ = coins;
                 let now = chrono::Utc::now().timestamp();
                 if let Err(e) = w.store.insert_tx(&unsigned_tx, wallet::store::MEMPOOL_HEIGHT, &bitcoin::BlockHash::all_zeros(), 0, now) {
                     tracing::warn!("storing coinjoin tx: {e}");
@@ -583,7 +582,7 @@ impl CoinJoinManager {
                 // The user's stop cancels the parent token; a round timeout only cancels a child.
                 Ok(!cancel.is_cancelled() && self.cancel.lock().unwrap().as_ref().map(|c| !c.is_cancelled()).unwrap_or(false))
             }
-            Err(CjError::UnknownRoundEnding { coins, output_scripts, msg }) => {
+            Err(CjError::UnknownRoundEnding { output_scripts, msg, .. }) => {
                 tracing::warn!("{}: round ending unknown: {msg}", self.wallet_name);
                 let mut w = self.wallet.lock().await;
                 for s in &output_scripts {
@@ -591,7 +590,6 @@ impl CoinJoinManager {
                         k.state = KeyState::Used;
                     }
                 }
-                let _ = coins;
                 w.km.save().ok();
                 Ok(true)
             }

@@ -30,15 +30,15 @@ impl<'de> Deserialize<'de> for TimeSpan {
         let s = String::deserialize(d)?;
         let mut secs: u64 = 0;
         for part in s.split_whitespace() {
-            let (num, unit) = part.split_at(part.len() - 1);
-            let n: u64 = num.trim().parse().map_err(serde::de::Error::custom)?;
-            secs += match unit {
-                "d" => n * 86400,
-                "h" => n * 3600,
-                "m" => n * 60,
-                "s" => n,
+            let (num, mult) = match part.chars().last() {
+                Some('d') => (&part[..part.len() - 1], 86400),
+                Some('h') => (&part[..part.len() - 1], 3600),
+                Some('m') => (&part[..part.len() - 1], 60),
+                Some('s') => (&part[..part.len() - 1], 1),
                 _ => return Err(serde::de::Error::custom(format!("bad timespan {s}"))),
             };
+            let n: u64 = num.trim().parse().map_err(serde::de::Error::custom)?;
+            secs = n.checked_mul(mult).and_then(|v| secs.checked_add(v)).ok_or_else(|| serde::de::Error::custom(format!("bad timespan {s}")))?;
         }
         Ok(TimeSpan(Duration::from_secs(secs)))
     }
@@ -269,7 +269,10 @@ impl RoundState {
         self.blame_of.chars().any(|c| c != '0')
     }
     pub fn input_registration_end(&self) -> chrono::DateTime<chrono::FixedOffset> {
-        self.input_registration_start + self.input_registration_timeout.0
+        chrono::Duration::from_std(self.input_registration_timeout.0)
+            .ok()
+            .and_then(|d| self.input_registration_start.checked_add_signed(d))
+            .unwrap_or(self.input_registration_start)
     }
 
     /// Recomputes the round id from the parameters (Wasabi `RoundState.IsRoundIdMatching`).
@@ -470,4 +473,15 @@ pub struct HumanMonitorRound {
 #[serde(rename_all = "PascalCase")]
 pub struct HumanMonitorResponse {
     pub round_states: Vec<HumanMonitorRound>,
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn timespan_rejects_garbage_without_panicking() {
+        for bad in ["\"0d 0h 1m 0\u{e9}\"", "\"\u{e9}\"", "\"99999999999999999999d\"", "\"5x\""] {
+            assert!(serde_json::from_str::<super::TimeSpan>(bad).is_err(), "{bad}");
+        }
+        assert_eq!(serde_json::from_str::<super::TimeSpan>("\"0d 0h 21m 0s\"").unwrap().0.as_secs(), 1260);
+    }
 }

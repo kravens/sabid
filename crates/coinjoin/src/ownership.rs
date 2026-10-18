@@ -5,7 +5,7 @@ use bitcoin::hashes::{sha256, sha512, Hash, HashEngine, Hmac, HmacEngine};
 use bitcoin::key::{Secp256k1, TapTweak, UntweakedKeypair};
 use bitcoin::secp256k1::{ecdsa, schnorr, Message, PublicKey, SecretKey, XOnlyPublicKey};
 use bitcoin::{ScriptBuf, VarInt};
-use bitcoin::consensus::encode::{serialize, Encodable};
+use bitcoin::consensus::encode::serialize;
 
 pub const VERSION_MAGIC: [u8; 4] = [0x53, 0x4c, 0x00, 0x19];
 pub const FLAG_USER_CONFIRMATION: u8 = 0x01;
@@ -77,7 +77,7 @@ impl OwnershipProof {
         let flags = b[4];
         let mut off = 5;
         let n = read_varint(b, &mut off)? as usize;
-        let mut identifiers = Vec::with_capacity(n);
+        let mut identifiers = Vec::new();
         for _ in 0..n {
             let id: [u8; 32] = b.get(off..off + 32).ok_or(ProofError::Malformed("identifier"))?.try_into().unwrap();
             identifiers.push(id);
@@ -87,7 +87,7 @@ impl OwnershipProof {
         let script_sig = b.get(off..off + ss_len).ok_or(ProofError::Malformed("scriptSig"))?.to_vec();
         off += ss_len;
         let wn = read_varint(b, &mut off)? as usize;
-        let mut witness = Vec::with_capacity(wn);
+        let mut witness = Vec::new();
         for _ in 0..wn {
             let l = read_varint(b, &mut off)? as usize;
             witness.push(b.get(off..off + l).ok_or(ProofError::Malformed("witness item"))?.to_vec());
@@ -200,12 +200,6 @@ pub fn ownership_identifier(master_private_key: &[u8; 32], script_pubkey: &Scrip
     let mut e = HmacEngine::<sha256::Hash>::new(&node.key());
     e.input(script_pubkey.as_bytes());
     Hmac::<sha256::Hash>::from_engine(e).to_byte_array()
-}
-
-#[allow(dead_code)]
-fn _encodable(v: &VarInt) -> usize {
-    let mut b = Vec::new();
-    v.consensus_encode(&mut b).unwrap()
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
 //! Scan: match every filter against the wallet's scripts, fetch matching blocks, store the
 //! wallet's transactions. Blocks come from Wasabi's on-disk block cache when present, else bitcoind.
 
+use futures_util::future::join_all;
 use crate::bitcoind::Bitcoind;
 use crate::filters::{FilterRow, SEGWIT_ACTIVATION_HEIGHT};
 use crate::keymanager::KeyManager;
@@ -98,25 +99,6 @@ pub async fn fetch_blocks(blocks: &BlockSource, rows: &[FilterRow], matched: &[u
     }
     out.sort_by_key(|(i, _)| *i);
     Ok(out)
-}
-
-async fn join_all<F: std::future::Future>(futs: impl IntoIterator<Item = F>) -> Vec<F::Output> {
-    let mut handles: Vec<std::pin::Pin<Box<F>>> = futs.into_iter().map(Box::pin).collect();
-    let mut results: Vec<Option<F::Output>> = (0..handles.len()).map(|_| None).collect();
-    std::future::poll_fn(|cx| {
-        let mut done = true;
-        for (i, h) in handles.iter_mut().enumerate() {
-            if results[i].is_none() {
-                match h.as_mut().poll(cx) {
-                    std::task::Poll::Ready(v) => results[i] = Some(v),
-                    std::task::Poll::Pending => done = false,
-                }
-            }
-        }
-        if done { std::task::Poll::Ready(()) } else { std::task::Poll::Pending }
-    })
-    .await;
-    results.into_iter().map(|r| r.unwrap()).collect()
 }
 
 /// Phase 3 (under the wallet lock): store the wallet's transactions of the matched blocks and

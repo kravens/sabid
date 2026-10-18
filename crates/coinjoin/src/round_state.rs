@@ -59,6 +59,10 @@ impl RoundStateUpdater {
         let mut updated: Vec<RoundState> = Vec::new();
         let mut fresh: Vec<RoundState> = Vec::new();
         for mut rs in resp.round_states {
+            if rs.coinjoin_state.parameters().is_none() {
+                tracing::warn!("round {} has no RoundCreated event; ignoring it", &rs.id[..rs.id.len().min(8)]);
+                continue;
+            }
             if let Some(old) = rounds.iter().find(|r| r.id == rs.id) {
                 verify_input_proofs(&rs, &old.parameters().coordination_identifier)?;
                 let mut events = old.coinjoin_state.events().to_vec();

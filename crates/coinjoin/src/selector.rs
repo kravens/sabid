@@ -64,16 +64,12 @@ impl UtxoSelectionParameters {
         mining_fee_rate: FeeRate,
         supported: &[ScriptType],
         rng: &mut R,
-    ) -> Self {
+    ) -> Option<Self> {
         let out_types: Vec<ScriptType> = allowed_output_types.iter().copied().filter(|t| supported.contains(t)).collect();
-        let max_vsize_type = *out_types.iter().max_by_key(|t| t.input_vsize() + t.output_vsize()).expect("output types");
+        let max_vsize_type = *out_types.iter().max_by_key(|t| t.input_vsize() + t.output_vsize())?;
         let min_reasonable = min_reasonable_output_amount(allowed_output_types, supported, mining_fee_rate, allowed_output_amounts.0);
-        let smallest = create_denominations(min_reasonable, allowed_output_amounts.1, mining_fee_rate, &[max_vsize_type], rng)
-            .iter()
-            .map(|o| o.effective_cost())
-            .min()
-            .expect("denominations");
-        Self { allowed_input_amounts, min_allowed_output_amount: smallest, mining_fee_rate, allowed_input_script_types: allowed_input_types }
+        let smallest = create_denominations(min_reasonable, allowed_output_amounts.1, mining_fee_rate, &[max_vsize_type], rng).iter().map(|o| o.effective_cost()).min()?;
+        Some(Self { allowed_input_amounts, min_allowed_output_amount: smallest, mining_fee_rate, allowed_input_script_types: allowed_input_types })
     }
 }
 

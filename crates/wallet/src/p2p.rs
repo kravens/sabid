@@ -2,7 +2,6 @@
 //! for blocks that are neither cached nor obtainable from the user's node.
 
 use bitcoin::consensus::encode::{deserialize_partial, serialize};
-use bitcoin::hashes::Hash;
 use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
 use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin::p2p::message_network::VersionMessage;
@@ -158,9 +157,4 @@ async fn fetch_from_peer(socks: &str, peer: &str, magic: Magic, hash: &BlockHash
             _ => {}
         }
     }
-}
-
-#[allow(dead_code)]
-fn _assert_hash(h: &BlockHash) -> [u8; 32] {
-    h.to_byte_array()
 }

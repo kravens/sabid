@@ -173,8 +173,9 @@ impl CredentialClient {
         if amounts.len() > CREDENTIAL_NUMBER {
             return Err(Error::Invalid("at most two credentials can be requested"));
         }
-        if credentials.len() > CREDENTIAL_NUMBER {
-            return Err(Error::Invalid("at most two credentials can be presented"));
+        if credentials.len() != CREDENTIAL_NUMBER {
+            // The wire format and the C request struct hold exactly two presentations.
+            return Err(Error::Invalid("exactly two credentials must be presented"));
         }
         let mut amounts_padded = amounts.to_vec();
         if !amounts_padded.is_empty() {

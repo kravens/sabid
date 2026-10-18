@@ -15,6 +15,7 @@ use bitcoin::transaction::Version;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
+use futures_util::future::{join_all, try_join_all};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -172,7 +173,7 @@ pub fn scheduled_instants(n: usize, start: Instant, end: Instant, max_delay: Dur
 
 fn to_datetime(end: chrono::DateTime<chrono::FixedOffset>) -> Instant {
     let remaining = end.signed_duration_since(chrono::Utc::now()).to_std().unwrap_or(Duration::ZERO);
-    Instant::now() + remaining
+    Instant::now().checked_add(remaining).unwrap_or_else(|| Instant::now() + Duration::from_secs(365 * 86400))
 }
 
 fn round_coins(round: &RoundState) -> Vec<ForeignCoin> {
@@ -289,7 +290,7 @@ impl CoinJoinClient {
             let supported = self.destinations.supported_script_types();
             let in_types: Vec<ScriptType> = p.allowed_input_types.iter().filter_map(|t| ScriptType::from_u8(*t)).collect();
             let out_types: Vec<ScriptType> = p.allowed_output_types.iter().filter_map(|t| ScriptType::from_u8(*t)).collect();
-            let params = UtxoSelectionParameters::from_round(
+            let Some(params) = UtxoSelectionParameters::from_round(
                 (p.allowed_input_amounts.min, p.allowed_input_amounts.max),
                 (p.allowed_output_amounts.min, p.allowed_output_amounts.max),
                 in_types.clone(),
@@ -297,7 +298,11 @@ impl CoinJoinClient {
                 FeeRate::from_fee_per_k(p.mining_fee_rate),
                 &supported,
                 &mut rand::thread_rng(),
-            );
+            ) else {
+                exclude = round.id.clone();
+                tracing::info!("{}", Self::log(&round, "Skipping the round since it allows no output type or denomination this wallet can use."));
+                continue;
+            };
             my_coins = self.selector.select_coins_for_round(&coin_candidates, &params, liquidity_clue, &mut rand::thread_rng());
             if !in_types.contains(&ScriptType::P2WPKH) || !out_types.contains(&ScriptType::P2WPKH) {
                 exclude = round.id.clone();
@@ -533,7 +538,7 @@ impl CoinJoinClient {
                 }
             });
         }
-        let results = futures_join_all(tasks).await;
+        let results = join_all(tasks).await;
         let mut alices = Vec::new();
         for r in results {
             match r {
@@ -582,7 +587,7 @@ impl CoinJoinClient {
                         tracing::info!("round {}: connection confirmed for {}", &alice.round_id[..8], alice.coin.outpoint);
                         return Ok(());
                     }
-                    Ok(false) => {}
+                    Ok(false) => tokio::time::sleep(Duration::from_secs(1)).await,
                     Err(e) => return Err(CjError::from(e)),
                 }
             }
@@ -650,7 +655,7 @@ impl CoinJoinClient {
             });
         }
         let registered: Vec<OutPoint> = alices.iter().map(|a| a.coin.outpoint).collect();
-        let available_vsizes: Vec<i64> = alices.iter().flat_map(|a| a.issued_vsize.iter().map(|c| c.value()).filter(|v| *v > 0)).collect();
+        let available_vsizes: Vec<i64> = alices.iter().map(|a| a.issued_vsize.iter().map(|c| c.value()).sum()).collect();
         let all_coins = round_coins(&round);
         let (ours, theirs): (Vec<ForeignCoin>, Vec<ForeignCoin>) = all_coins.into_iter().partition(|c| registered.contains(&c.outpoint));
         let registered_effective: Vec<i64> = alices.iter().map(|a| a.effective_value()).collect();
@@ -663,8 +668,6 @@ impl CoinJoinClient {
         if let Some(v) = &self.input_verifier {
             v(theirs.clone()).await.map_err(|m| CjError::client(CoinjoinError::CoordinatorLiedAboutInputs, m))?;
         }
-        let payments_allowed = alices.iter().all(|a| a.coin.is_private(self.min_anon_score_for_payments));
-        let _ = payments_allowed;
         let outputs = self.get_outputs(&p, &registered_effective, &their_effective, available_vsizes.iter().sum())?;
         let inputs: Vec<(i64, i64)> = alices.iter().zip(&available_vsizes).map(|(a, v)| (a.effective_value(), *v)).collect();
         let out_values: Vec<(i64, i64)> = outputs.iter().map(|o| (effective_cost(o.value.to_sat() as i64, &o.script_pubkey, fee_rate), script_output_vsize(&o.script_pubkey))).collect();
@@ -739,7 +742,7 @@ impl CoinJoinClient {
                 tracing::info!("round {}: failed to register signal ready to sign with message {e}. Ignoring...", &a.round_id[..8]);
             }
         });
-        futures_join_all(tasks).await;
+        join_all(tasks).await;
     }
 
     /// `ProceedWithSigningStateAsync`
@@ -749,7 +752,6 @@ impl CoinJoinClient {
             _ = cancel.cancelled() => return Err(CjError::Cancelled),
         };
         let p = round.parameters().clone();
-        let fee_rate = FeeRate::from_fee_per_k(p.mining_fee_rate);
         let remaining = p.transaction_signing_timeout.0.saturating_sub(Duration::from_secs(10));
         let signing_end = Instant::now() + remaining;
         self.emit(Progress::EnteringSigning { round_id: round.id.clone() });
@@ -800,11 +802,13 @@ impl CoinJoinClient {
         }
         self.sign_transaction(&to_sign, &unsigned, start, signing_end, &phase_cancel).await?;
         tracing::info!("{}", Self::log(&round, &format!("{} of your Alices have signed the coinjoin transaction.", to_sign.len())));
-        let _ = fee_rate;
         Ok((unsigned.tx, to_sign))
     }
 
     async fn sign_transaction(&self, alices: &[AliceClient], unsigned: &UnsignedCoinJoin, start: Instant, end: Instant, cancel: &CancellationToken) -> Result<(), CjError> {
+        if alices.is_empty() {
+            return Ok(());
+        }
         let max_delay = Duration::from_secs(50);
         let mut start = start;
         let unsigned = Arc::new(UnsignedCoinJoin { tx: unsigned.tx.clone(), prevouts: unsigned.prevouts.clone(), ownership_proofs: unsigned.ownership_proofs.clone() });
@@ -839,7 +843,7 @@ impl CoinJoinClient {
                 }
             }
         });
-        for r in futures_join_all(tasks).await {
+        for r in join_all(tasks).await {
             r?;
         }
         Ok(())
@@ -1008,7 +1012,7 @@ impl Scheduler {
                 self.reissue_node(&bob, node, amount_in, vsize_in).await
             }));
         }
-        let all = futures_try_join_all(tasks);
+        let all = try_join_all(tasks);
         tokio::select! {
             r = all => r?,
             _ = cancel.cancelled() => return Err(CjError::Cancelled),
@@ -1039,7 +1043,7 @@ impl Scheduler {
                 }
             }));
         }
-        let all = futures_join_all(tasks);
+        let all = join_all(tasks);
         let results = tokio::select! {
             r = all => r,
             _ = cancel.cancelled() => return Err(CjError::Cancelled),
@@ -1089,61 +1093,6 @@ fn separate_extra_credentials(issued: &[Credential], required: &[i64]) -> (Vec<C
         extra.push(c.clone());
     }
     (wanted, extra)
-}
-
-/// Like `futures_join_all`, but the first error ends the wait: a failed credential request must not
-/// leave its dependants waiting until the phase ends.
-async fn futures_try_join_all<T, E, F: Future<Output = Result<T, E>>>(futs: impl IntoIterator<Item = F>) -> Result<Vec<T>, E> {
-    let mut handles: Vec<Pin<Box<F>>> = futs.into_iter().map(Box::pin).collect();
-    let mut results: Vec<Option<T>> = (0..handles.len()).map(|_| None).collect();
-    std::future::poll_fn(|cx| {
-        let mut all_done = true;
-        for (i, h) in handles.iter_mut().enumerate() {
-            if results[i].is_none() {
-                match h.as_mut().poll(cx) {
-                    std::task::Poll::Ready(Ok(v)) => results[i] = Some(v),
-                    std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
-                    std::task::Poll::Pending => all_done = false,
-                }
-            }
-        }
-        if all_done {
-            std::task::Poll::Ready(Ok(()))
-        } else {
-            std::task::Poll::Pending
-        }
-    })
-    .await?;
-    Ok(results.into_iter().map(|r| r.unwrap()).collect())
-}
-
-async fn futures_join_all<F: Future>(futs: impl IntoIterator<Item = F>) -> Vec<F::Output> {
-    let futs: Vec<F> = futs.into_iter().collect();
-    let mut out = Vec::with_capacity(futs.len());
-    // Drive all concurrently.
-    let mut handles: Vec<Pin<Box<F>>> = futs.into_iter().map(Box::pin).collect();
-    let mut results: Vec<Option<F::Output>> = (0..handles.len()).map(|_| None).collect();
-    std::future::poll_fn(|cx| {
-        let mut all_done = true;
-        for (i, h) in handles.iter_mut().enumerate() {
-            if results[i].is_none() {
-                match h.as_mut().poll(cx) {
-                    std::task::Poll::Ready(v) => results[i] = Some(v),
-                    std::task::Poll::Pending => all_done = false,
-                }
-            }
-        }
-        if all_done {
-            std::task::Poll::Ready(())
-        } else {
-            std::task::Poll::Pending
-        }
-    })
-    .await;
-    for r in results {
-        out.push(r.unwrap());
-    }
-    out
 }
 
 #[cfg(test)]

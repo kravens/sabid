@@ -368,6 +368,9 @@ impl DependencyGraph {
     }
 
     fn reduce_nodes(&mut self, mut nodes: Vec<usize>, max_count: usize, ct: CredentialType) -> R<Vec<usize>> {
+        if max_count == 0 && !nodes.is_empty() {
+            return Err(GraphError("cannot reduce nodes to zero (would loop forever)".into()));
+        }
         while nodes.len() > max_count {
             let take = K.min(nodes.len());
             let head: Vec<usize> = nodes.drain(..take).collect();

@@ -2,7 +2,6 @@
 
 use crate::rpc::{Ctx, Params, RpcError};
 use serde_json::{json, Value};
-use wallet::KeyState;
 
 pub async fn call(ctx: &Ctx, method: &str, p: Params) -> Result<Value, RpcError> {
     let d = &ctx.daemon;
@@ -69,9 +68,9 @@ pub async fn call(ctx: &Ctx, method: &str, p: Params) -> Result<Value, RpcError>
             Ok(info)
         }
         "listunspentcoins" | "listcoins" => {
+            let tip = d.filters.lock().await.tip_height().unwrap_or(0);
             let w = ctx.wallet().await?;
             let lw = w.lock().await;
-            let tip = d.filters.lock().await.tip_height().unwrap_or(0);
             let all = method == "listcoins";
             Ok(Value::Array(
                 lw.state
@@ -308,6 +307,3 @@ fn accounts(km: &wallet::KeyManager) -> Value {
     }
     Value::Array(a)
 }
-
-#[allow(dead_code)]
-fn _unused(_: KeyState) {}

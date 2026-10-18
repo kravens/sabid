@@ -10,7 +10,7 @@ use bitcoin::{OutPoint, ScriptBuf, Txid, Witness};
 use coinjoin::keychain::{derivation_path, KeyChain, KeyChainError, UnsignedCoinJoin};
 use coinjoin::ownership::OwnershipProof;
 use coinjoin::units::{FeeRate, ScriptType};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -204,6 +204,3 @@ impl From<ColdcardError> for KeyChainError {
         KeyChainError::Device(e.0)
     }
 }
-
-#[allow(dead_code)]
-fn _unused(_: BTreeMap<u8, u8>) {}

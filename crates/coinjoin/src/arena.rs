@@ -182,7 +182,11 @@ impl AliceClient {
     pub async fn register(round: &RoundState, arena: ArenaClient, coin: CjCoin, key_chain: &Arc<dyn KeyChain>) -> Result<Self, ArenaError> {
         let p = round.parameters();
         let commitment = commitment_data(&arena.coordinator_identifier, &round.id).map_err(|e| ArenaError::Other(e.to_string()))?;
-        let proof = key_chain.get_ownership_proof(&coin.script, &commitment).map_err(|e| ArenaError::Other(e.to_string()))?;
+        let proof = {
+            // Device key chains block on USB for up to a minute; keep that off the async workers.
+            let (kc, script, c) = (key_chain.clone(), coin.script.clone(), commitment.clone());
+            tokio::task::spawn_blocking(move || kc.get_ownership_proof(&script, &c)).await.map_err(|e| ArenaError::Other(e.to_string()))?.map_err(|e| ArenaError::Other(e.to_string()))?
+        };
         let outpoint_hex = wasabi_proto::script::outpoint_to_hex(&coin.outpoint);
         let (alice_id, issued) = arena.register_input(&round.id, &outpoint_hex, &hex::encode_upper(proof.to_bytes())).await?;
         tracing::info!("round {}: registered {}", &round.id[..8], coin.outpoint);

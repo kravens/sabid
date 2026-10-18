@@ -245,9 +245,9 @@ impl AmountDecomposer {
             let mut seen = HashSet::new();
             finals.iter().filter_map(|c| c.0.first().cloned()).filter(|o| seen.insert(o.clone())).collect()
         };
-        let largest = largest_set.choose(rng).expect("candidates").clone();
+        let Some(largest) = largest_set.choose(rng).cloned() else { anyhow::bail!("no decomposition fits the available vsize") };
         let matching: Vec<&Candidate> = finals.iter().filter(|c| c.0.first() == Some(&largest)).collect();
-        let final_candidate = matching.choose(rng).expect("candidates").0.clone();
+        let Some(final_candidate) = matching.choose(rng).map(|c| c.0.clone()) else { anyhow::bail!("no decomposition fits the available vsize") };
         let total_output: i64 = final_candidate.iter().map(|x| x.effective_cost()).sum();
         if total_output > my_input_sum {
             anyhow::bail!("The decomposer is creating money. Aborting.");

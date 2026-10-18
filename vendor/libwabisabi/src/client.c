@@ -97,6 +97,8 @@ internal_create_real(wabisabi_client_state_t* c, const int64_t* amounts_to_reque
     /* sabid patch: a presentation-only request (C# WabiSabiClient.CreateRequest(credentialsToPresent))
      * presents credentials and requests none: no range proofs, n_requested = 0, delta < 0. */
     const int n_requested = presentation_only ? 0 : WABISABI_CREDENTIAL_COUNT;
+    memset(out_req, 0, sizeof *out_req);
+    memset(out_val, 0, sizeof *out_val);
     /* Pad amounts to k */
     int64_t amounts[WABISABI_CREDENTIAL_COUNT] = {0};
     for (int i = 0; i < n_amounts && i < WABISABI_CREDENTIAL_COUNT; i++) {
