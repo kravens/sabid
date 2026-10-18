@@ -42,6 +42,17 @@ A Trezor wallet imported with a coinjoin account (SLIP-25, `TaprootAccountKeyPat
 `CoinJoinDeviceMaxMiningFeeRate` sat/vB (hold to confirm on the device); ownership proofs and
 signatures then come from the device without further interaction, one round per authorized round.
 
+A Coldcard Mk4 on the `coinjoin-fw-2` firmware (6.6.1X) is driven over hidraw (`/dev/hidraw*`
+must be readable). `startcoinjoin` installs the HSM policy built from the wallet's
+`ColdcardMaxSatsLeaving`, `ColdcardMaxTransactionsPerPeriod`, `ColdcardPeriodMinutes`,
+`ColdcardMinInputs`, `CoinJoinDeviceMaxRounds` and `CoinJoinDeviceMaxMiningFeeRate` (approve it on
+the device, or it reuses the policy recorded in `ColdcardActivePolicyHash` when that one is already
+running). Ownership proofs come from `slp9`; the round is signed as a PSBT under the policy. The
+device needs about 4.3 ms per PSBT byte (41 KB, 331 inputs: 175 s), so it can only finish rounds
+whose transaction-signing phase is long enough; coinjoin.nl (100 inputs max, 129 s) fits, kruw.io
+(500 inputs, 57 s) does not. `cargo test -p hw --release --test coldcard_timing -- --ignored
+--nocapture` with `SABID_WALLET_JSON` set times a synthetic round on the connected device.
+
 ## Layout
 
 | crate | what |
@@ -51,5 +62,5 @@ signatures then come from the device without further interaction, one round per 
 | `wasabi-proto` | coordinator models in Wasabi's JSON dialect, HTTP client with per-identity Tor circuits |
 | `wallet` | Wasabi wallet files, BIP158 scan, block sources (cache, bitcoind, P2P onion peers), coins/history |
 | `coinjoin` | coin selector, amount decomposer, dependency graph, round client, ownership proofs, soft key chain |
-| `hw` | Trezor bridge transport, protobuf codec, device flows, Trezor key chain |
+| `hw` | Trezor bridge transport, protobuf codec, device flows, Trezor key chain; Coldcard hidraw link, HSM policy, key chain |
 | `sabid` | daemon: Tor, sync loop, JSON-RPC, coinjoin manager, CLI |
