@@ -961,8 +961,13 @@ impl Scheduler {
     }
 
     fn fill(&self, ct: CredentialType, edge_ids: &[usize], creds: Vec<Credential>) {
+        if creds.len() < edge_ids.len() {
+            tracing::warn!("{} {:?} credential(s) issued for {} edge(s); the dependent requests cannot proceed.", creds.len(), ct, edge_ids.len());
+        }
         for (id, c) in edge_ids.iter().zip(creds) {
-            let _ = self.slots[ct as usize][*id].send(Some(c));
+            // `send` drops the value when nobody has subscribed yet (the consumer task may not have
+            // been polled up to its subscribe), which left every dependent request waiting forever.
+            self.slots[ct as usize][*id].send_replace(Some(c));
         }
     }
 
@@ -1003,14 +1008,11 @@ impl Scheduler {
                 self.reissue_node(&bob, node, amount_in, vsize_in).await
             }));
         }
-        let all = futures_join_all(tasks);
-        let results = tokio::select! {
-            r = all => r,
+        let all = futures_try_join_all(tasks);
+        tokio::select! {
+            r = all => r?,
             _ = cancel.cancelled() => return Err(CjError::Cancelled),
         };
-        for r in results {
-            r?;
-        }
         Ok(())
     }
 
@@ -1089,6 +1091,32 @@ fn separate_extra_credentials(issued: &[Credential], required: &[i64]) -> (Vec<C
     (wanted, extra)
 }
 
+/// Like `futures_join_all`, but the first error ends the wait: a failed credential request must not
+/// leave its dependants waiting until the phase ends.
+async fn futures_try_join_all<T, E, F: Future<Output = Result<T, E>>>(futs: impl IntoIterator<Item = F>) -> Result<Vec<T>, E> {
+    let mut handles: Vec<Pin<Box<F>>> = futs.into_iter().map(Box::pin).collect();
+    let mut results: Vec<Option<T>> = (0..handles.len()).map(|_| None).collect();
+    std::future::poll_fn(|cx| {
+        let mut all_done = true;
+        for (i, h) in handles.iter_mut().enumerate() {
+            if results[i].is_none() {
+                match h.as_mut().poll(cx) {
+                    std::task::Poll::Ready(Ok(v)) => results[i] = Some(v),
+                    std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
+                    std::task::Poll::Pending => all_done = false,
+                }
+            }
+        }
+        if all_done {
+            std::task::Poll::Ready(Ok(()))
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await?;
+    Ok(results.into_iter().map(|r| r.unwrap()).collect())
+}
+
 async fn futures_join_all<F: Future>(futs: impl IntoIterator<Item = F>) -> Vec<F::Output> {
     let futs: Vec<F> = futs.into_iter().collect();
     let mut out = Vec::with_capacity(futs.len());
@@ -1120,6 +1148,17 @@ async fn futures_join_all<F: Future>(futs: impl IntoIterator<Item = F>) -> Vec<F
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn scheduler_keeps_a_credential_filled_before_anyone_subscribes() {
+        use super::*;
+        let g = DependencyGraph::resolve(&[(10, 10)], &[(6, 4)], 1_000, 1_000).unwrap();
+        let s = Scheduler::new(&g);
+        let edge = g.out_edges(g.inputs()[0], CredentialType::Amount)[0].id;
+        s.fill(CredentialType::Amount, &[edge], vec![Credential([0u8; 105])]);
+        let got = tokio::time::timeout(Duration::from_secs(1), s.await_edges(CredentialType::Amount, &[edge])).await.expect("a filled slot must resolve for a late subscriber").unwrap();
+        assert_eq!(got.len(), 1);
+    }
+
     use super::*;
 
     #[test]
