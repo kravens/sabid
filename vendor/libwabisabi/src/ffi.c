@@ -256,6 +256,13 @@ write_validation_state(uint8_t* buf, const wabisabi_response_validation_t* val) 
     buf[off++] = (uint8_t)(val->n_requested >> 24);
 
     for (int i = 0; i < WABISABI_CREDENTIAL_COUNT; i++) {
+        if (i >= val->n_requested) {
+            /* Presentation-only requests fill no slot: never serialize the unset group element
+             * (secp256k1 aborts the process on an invalid point). Zero the slot instead. */
+            memset(buf + off, 0, 8 + WABISABI_SCALAR_SIZE + WABISABI_GE_SIZE);
+            off += 8 + WABISABI_SCALAR_SIZE + WABISABI_GE_SIZE;
+            continue;
+        }
         int64_t v = val->requested[i].value;
         for (int j = 0; j < 8; j++) {
             buf[off++] = (uint8_t)(v >> (8 * j));
@@ -283,7 +290,15 @@ read_validation_state(const uint8_t* buf, wabisabi_response_validation_t* val) {
                            | ((uint32_t)buf[off+3] << 24));
     off += 4;
 
+    if (val->n_requested < 0 || val->n_requested > WABISABI_CREDENTIAL_COUNT) {
+        return -1;
+    }
     for (int i = 0; i < WABISABI_CREDENTIAL_COUNT; i++) {
+        if (i >= val->n_requested) {
+            /* zeroed slot of a presentation-only request, see write_validation_state */
+            off += 8 + WABISABI_SCALAR_SIZE + WABISABI_GE_SIZE;
+            continue;
+        }
         int64_t v = 0;
         for (int j = 0; j < 8; j++) {
             v |= ((int64_t)buf[off++]) << (8 * j);
@@ -654,6 +669,7 @@ wabisabi_client_create_zero_request(const uint8_t* rand_bytes,
      * (~1 MB) thread-pool stack; heap-allocate it. */
     wabisabi_zero_request_t* req = malloc(sizeof(*req));
     wabisabi_response_validation_t val;
+    memset(&val, 0, sizeof val);
     wabisabi_error_t ret = WABISABI_OK;
     if (!req) {
         ret = WABISABI_ERR_ALLOC;
@@ -746,6 +762,7 @@ create_real_request_impl(const uint8_t* iparams_bytes, int64_t max_amount,
      * (~1 MB) thread-pool stack; heap-allocate it. */
     wabisabi_real_request_t* req = malloc(sizeof(*req));
     wabisabi_response_validation_t val;
+    memset(&val, 0, sizeof val);
     wabisabi_error_t ret = WABISABI_OK;
     if (!req) {
         secure_zero(creds, sizeof(creds));
@@ -863,6 +880,7 @@ wabisabi_client_handle_response(const uint8_t* iparams_bytes,
     client.range_proof_width = 0;
 
     wabisabi_response_validation_t val;
+    memset(&val, 0, sizeof val);
     if (read_validation_state(val_bytes, &val) < 0) {
         return WABISABI_ERR_PARSE;
     }

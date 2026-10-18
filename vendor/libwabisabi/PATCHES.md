@@ -5,3 +5,12 @@
    zero-padded credentials; Wasabi's output registration presents credentials and requests none
    (`WabiSabiClient.CreateRequest(credentialsToPresent)`, `Delta < 0`, three proofs). The upstream
    issuer already verifies such requests. Worth upstreaming to zkSNACKs/NWabiSabi.
+
+## ffi.c: validation state of a presentation-only request (2026-10-18)
+
+`write_validation_state` serialized all `WABISABI_CREDENTIAL_COUNT` requested slots, but a
+presentation-only request (`n_requested = 0`, output registration) fills none, so it serialized an
+uninitialized group element and secp256k1's illegal-argument callback aborted the daemon in a live
+round. Slots at or beyond `n_requested` are now written as zeros and skipped when read, and the
+`val` locals in the FFI entry points are zeroed.
+

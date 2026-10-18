@@ -372,6 +372,9 @@ mod tests {
 
         // Presentation-only (output registration): spend both, request nothing (delta -100_000).
         let present = client.create_request(&[], &creds2).unwrap();
+        // No requested slots: the validation state carries zeros there, never an unset point
+        // (serializing one made secp256k1 abort the daemon in a live round).
+        assert!(present.validation.0[207..].iter().all(|b| *b == 0));
         assert_eq!(present.request.delta, -100_000);
         assert_eq!(present.request.requested.len(), 0);
         assert_eq!(present.request.presented.len(), 2);
