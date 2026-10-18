@@ -261,6 +261,90 @@ pub async fn call(ctx: &Ctx, method: &str, p: Params) -> Result<Value, RpcError>
             }
             Ok(Value::Null)
         }
+        "build" | "send" => {
+            let name = ctx.wallet_name.clone().ok_or_else(|| RpcError::internal("Wallet name is invalid or not allowed."))?;
+            let payments: Vec<crate::send::Payment> = p
+                .get(0, "payments")
+                .and_then(Value::as_array)
+                .ok_or_else(|| RpcError::invalid_params("missing parameter 'payments'"))?
+                .iter()
+                .map(|pm| {
+                    let addr = pm.get("sendto").and_then(Value::as_str).ok_or_else(|| RpcError::invalid_params("payment without 'sendto'"))?;
+                    let script = addr.parse::<bitcoin::Address<_>>().map_err(|e| RpcError::invalid_params(format!("address: {e}")))?.require_network(d.network).map_err(|e| RpcError::invalid_params(e.to_string()))?.script_pubkey();
+                    let amount = pm.get("amount").and_then(Value::as_u64).ok_or_else(|| RpcError::invalid_params("payment without 'amount' (satoshis)"))?;
+                    Ok(crate::send::Payment { script, amount, subtract_fee: pm.get("subtractFee").and_then(Value::as_bool).unwrap_or(false) })
+                })
+                .collect::<Result<_, RpcError>>()?;
+            let label: String = p.get(0, "payments").and_then(Value::as_array).map(|a| a.iter().filter_map(|pm| pm.get("label").and_then(Value::as_str)).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+            let outpoints: Vec<bitcoin::OutPoint> = p
+                .get(1, "coins")
+                .and_then(Value::as_array)
+                .ok_or_else(|| RpcError::invalid_params("missing parameter 'coins'"))?
+                .iter()
+                .map(|c| {
+                    let txid = c.get("transactionid").and_then(Value::as_str).and_then(|s| s.parse().ok()).ok_or_else(|| RpcError::invalid_params("coin without 'transactionid'"))?;
+                    let vout = c.get("index").and_then(Value::as_u64).ok_or_else(|| RpcError::invalid_params("coin without 'index'"))? as u32;
+                    Ok(bitcoin::OutPoint { txid, vout })
+                })
+                .collect::<Result<_, RpcError>>()?;
+            let fee_rate = match (p.get(3, "feeRate").and_then(Value::as_f64), p.get(2, "feeTarget").and_then(Value::as_u64)) {
+                (Some(r), _) => r,
+                (None, Some(t)) => {
+                    let rates = d.fee_rates.read().await;
+                    rates.range(t as u32..).next().or_else(|| rates.iter().next_back()).map(|(_, v)| *v as f64).ok_or_else(|| RpcError::internal("No fee estimate available (is a Bitcoin Core node configured?); pass feeRate."))?
+                }
+                (None, None) => return Err(RpcError::invalid_params("Fee parameters are missing: feeTarget or feeRate.")),
+            };
+            let password = p.str_opt(4, "password");
+            let w = ctx.wallet().await?;
+            let (coins, change) = {
+                let mut lw = w.lock().await;
+                if !lw.loaded {
+                    return Err(RpcError::internal("Wallet is not fully synchronized yet."));
+                }
+                if lw.km.is_hardware_wallet() {
+                    return Err(RpcError::internal("Sending from a hardware wallet is not supported yet; it can only coinjoin here."));
+                }
+                let coins: Vec<wallet::store::Coin> = outpoints
+                    .iter()
+                    .map(|op| lw.state.unspent().find(|c| c.outpoint == *op).cloned().ok_or_else(|| RpcError::internal(format!("Coin {op} is not an unspent coin of this wallet."))))
+                    .collect::<Result<_, _>>()?;
+                let idx = lw.km.next_change_key(false).ok_or_else(|| RpcError::internal("No change key available."))?;
+                lw.km.keys[idx].state = wallet::KeyState::Locked;
+                lw.km.keys[idx].label = label.clone();
+                lw.km.save().map_err(RpcError::internal)?;
+                (coins, lw.km.keys[idx].script.clone())
+            };
+            let dust = (d.cfg.dust_threshold.parse::<f64>().unwrap_or(0.00001) * 1e8).round() as u64;
+            let built = crate::send::build(&coins, &payments, fee_rate, change.clone(), dust).map_err(RpcError::internal)?;
+            let kc = crate::coinjoin_manager::soft_key_chain(&w, password, &name).await.map_err(RpcError::internal)?;
+            let tx = crate::send::sign(&*kc, &built).map_err(RpcError::internal)?;
+            let hex = bitcoin::consensus::encode::serialize_hex(&tx);
+            tracing::info!("{name}: {method} {} input(s), {} output(s), fee {} sat at {fee_rate} sat/vB", tx.input.len(), tx.output.len(), built.fee);
+            if method == "build" {
+                return Ok(Value::String(hex));
+            }
+            let node = d.bitcoind.as_ref().ok_or_else(|| RpcError::internal("No Bitcoin Core node configured: use build and broadcast the transaction elsewhere."))?;
+            let txid = node.send_raw_transaction(&hex).await.map_err(|e| RpcError::internal(format!("broadcast: {e}")))?;
+            {
+                let mut lw = w.lock().await;
+                lw.store.insert_tx(&tx, wallet::store::MEMPOOL_HEIGHT, &<bitcoin::BlockHash as bitcoin::hashes::Hash>::all_zeros(), 0, chrono::Utc::now().timestamp()).map_err(RpcError::internal)?;
+                if built.change.is_some() {
+                    if let Some(k) = lw.km.key_for_script_mut(&change) {
+                        k.state = wallet::KeyState::Used;
+                    }
+                }
+                lw.km.save().map_err(RpcError::internal)?;
+                lw.rebuild_state().map_err(RpcError::internal)?;
+            }
+            Ok(json!({"txid": txid.to_string(), "tx": hex}))
+        }
+        "broadcast" => {
+            let hex = p.str(0, "txHex")?;
+            let node = d.bitcoind.as_ref().ok_or_else(|| RpcError::internal("No Bitcoin Core node configured."))?;
+            let txid = node.send_raw_transaction(&hex).await.map_err(|e| RpcError::internal(format!("broadcast: {e}")))?;
+            Ok(json!({"txid": txid.to_string()}))
+        }
         "stopcoinjoin" => {
             let name = ctx.wallet_name.clone().ok_or_else(|| RpcError::internal("Wallet name is invalid or not allowed."))?;
             if let Some(m) = d.managers.read().await.get(&name) {

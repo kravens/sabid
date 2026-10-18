@@ -6,6 +6,7 @@ mod mcp;
 mod methods;
 mod rpc;
 mod secrets;
+mod send;
 mod tor;
 mod wasabi_guard;
 

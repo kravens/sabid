@@ -19,10 +19,10 @@ design notes and the progress log.
   account over the bridge API), Coldcard Mk4 on the `coinjoin-fw-2` firmware (hidraw, HSM policy).
 - Wasabi-compatible JSON-RPC, a CLI, an MCP server.
 
-Not yet: sending outside coinjoin (`send`, `build`, `broadcast`, `payincoinjoin`), Passport and
-Krux, pure-Rust WabiSabi crypto (the vendored C library is used through FFI).
-`startcoinjoinsweep` (coinjoin into another wallet) and the device import/enable methods exist
-but have not run live end to end yet.
+Not yet: sending from a hardware wallet, payments inside coinjoins (`payincoinjoin`), fee bumps
+(`speeduptransaction`, `canceltransaction`), Passport and Krux, pure-Rust WabiSabi crypto (the
+vendored C library is used through FFI). `startcoinjoinsweep`, soft-wallet `send` and the device
+import/enable methods exist but have not run live end to end yet.
 
 ## Build
 
@@ -109,6 +109,9 @@ curl -s -u user:pass http://127.0.0.1:37128/MyWallet \
 | `listkeys` | | |
 | `excludefromcoinjoin` | `[txid, index, exclude]` | |
 | `getfeerates` | | from the node's `estimatesmartfee` |
+| `build` | `{payments, coins, feeTarget \| feeRate, password}` | soft wallets: signed transaction hex; the coins given are the inputs, change to the next internal key, RBF on |
+| `send` | same | builds, broadcasts through the node, records the transaction; returns `{txid, tx}` |
+| `broadcast` | `[txHex]` | through the node |
 | `unlockwallet` | `[password, ttlSeconds]` | soft wallets: decrypt the key in the daemon for `ttlSeconds` (default 3600, max 86400); `getwalletinfo.unlocked` |
 | `lockwallet` | | erase the decrypted key and stop a running coinjoin after its round |
 | `startcoinjoin` | `[password, stopWhenAllMixed, overridePlebStop]` | empty password uses the unlocked key; device wallets need none |
@@ -181,7 +184,9 @@ Example exchange:
 
 An agent can therefore load a wallet, inspect coins and anonymity scores, start a coinjoin on a
 hardware wallet (the device asks the human to approve the rounds or the HSM policy), and watch
-`coinjoinStatus` and `gethistory` until the round is broadcast.
+`coinjoinStatus` and `gethistory` until the round is broadcast. `build`, `send` and `broadcast`
+are reachable too: while a soft wallet is unlocked, an agent can spend from it. Unlock for as
+long as you mean that, or keep agents on hardware wallets, where the device confirms.
 
 ## Hardware wallets
 

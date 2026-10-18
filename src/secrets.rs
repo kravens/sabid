@@ -15,11 +15,20 @@ fn secret_field_name(k: &str) -> bool {
 
 /// Methods an agent may call through the MCP `rpc` tool: nothing that takes a password (soft
 /// wallets are unlocked on the daemon host) and nothing that stops the daemon.
-const AGENT_METHODS: [&str; 22] = [
+const AGENT_METHODS: [&str; 25] = [
     "getstatus", "listwallets", "loadwallet", "selectwallet", "getwalletinfo", "listunspentcoins", "listcoins", "gethistory", "getnewaddress", "listkeys",
     "excludefromcoinjoin", "getfeerates", "startcoinjoin", "startcoinjoinsweep", "stopcoinjoin", "enumeratedevices", "setcoinjoinlimits", "displayaddress", "lockwallet",
-    "importhardwarewallet", "enablecoinjoin", "enabletaproot",
+    "importhardwarewallet", "enablecoinjoin", "enabletaproot", "build", "send", "broadcast",
 ];
+
+/// Where a password sits in the methods that take one: positional index, and the object key.
+fn password_slot(method: &str) -> Option<usize> {
+    match method {
+        "startcoinjoin" | "startcoinjoinsweep" => Some(0),
+        "build" | "send" => Some(4),
+        _ => None,
+    }
+}
 
 fn is_base58(s: &str) -> bool {
     s.bytes().all(|b| b.is_ascii_alphanumeric() && !b"0OIl".contains(&b))
@@ -43,19 +52,21 @@ pub fn looks_secret(v: &Value) -> Option<String> {
     }
 }
 
-/// The MCP passthrough: only agent-safe methods, and never a password (`startcoinjoin`'s is
-/// blanked so the daemon uses the unlocked key).
+/// The MCP passthrough: only agent-safe methods, and never a password (a password slot is
+/// blanked so the daemon uses the key unlocked on its host).
 pub fn agent_call(method: &str, params: &mut Value) -> Result<(), String> {
     let m = method.to_ascii_lowercase();
     if !AGENT_METHODS.contains(&m.as_str()) {
         return Err(format!("'{method}' is not available through the MCP (no passwords, no daemon shutdown); run it with `sabid rpc` on the daemon host"));
     }
-    if m == "startcoinjoin" || m == "startcoinjoinsweep" {
-        if let Some(first) = params.as_array_mut().and_then(|a| a.first_mut()) {
-            *first = Value::String(String::new());
+    if let Some(slot) = password_slot(&m) {
+        if let Some(v) = params.as_array_mut().and_then(|a| a.get_mut(slot)) {
+            *v = Value::String(String::new());
         }
         if let Some(o) = params.as_object_mut() {
-            o.insert("password".into(), Value::String(String::new()));
+            if o.contains_key("password") {
+                o.insert("password".into(), Value::String(String::new()));
+            }
         }
     }
     Ok(())
@@ -92,9 +103,15 @@ mod tests {
         let mut o = json!({"password": "hunter2", "stopWhenAllMixed": false});
         agent_call("startcoinjoin", &mut o).unwrap();
         assert_eq!(o["password"], "");
-        for refused in ["unlockwallet", "send", "build", "stop", "recoverwallet"] {
+        for refused in ["unlockwallet", "stop", "recoverwallet", "createwallet"] {
             assert!(agent_call(refused, &mut json!([])).is_err(), "{refused}");
         }
+        let mut send = json!({"payments": [], "coins": [], "feeRate": 2, "password": "hunter2"});
+        agent_call("send", &mut send).unwrap();
+        assert_eq!(send["password"], "");
+        let mut build = json!([[], [], null, 2, "hunter2"]);
+        agent_call("build", &mut build).unwrap();
+        assert_eq!(build[4], "");
         assert!(agent_call("getwalletinfo", &mut json!([])).is_ok());
     }
 }
