@@ -58,7 +58,10 @@ pub struct Daemon {
     pub cfg: WasabiConfig,
     pub network: Network,
     pub datadir: PathBuf,
+    /// Where wallet files are read and written: sabid's own directory unless `--wallet-dir` says otherwise.
     pub wallet_dir: PathBuf,
+    /// Wasabi's wallet directory, copied from (never written) when a wallet is first loaded.
+    pub bootstrap_wallet_dir: Option<PathBuf>,
     pub socks: Option<String>,
     pub tor_enabled: bool,
     pub filters: Mutex<FilterStore>,
@@ -73,7 +76,7 @@ pub struct Daemon {
     pub shutdown: tokio::sync::Notify,
 }
 
-fn network_dir_name(n: Network) -> &'static str {
+pub fn network_dir_name(n: Network) -> &'static str {
     match n {
         Network::Bitcoin => "Main",
         Network::Testnet => "TestNet",
@@ -113,7 +116,8 @@ impl Daemon {
             cfg,
             network,
             datadir,
-            wallet_dir: wallet_dir.unwrap_or_else(|| wasabi_dir.join("Wallets")),
+            bootstrap_wallet_dir: wallet_dir.is_none().then(|| wasabi_dir.join("Wallets")),
+            wallet_dir: wallet_dir.unwrap_or_else(|| own_net_dir.join("Wallets")),
             socks,
             tor_enabled,
             filters: Mutex::new(filters),
@@ -129,16 +133,23 @@ impl Daemon {
     }
 
     pub fn wallet_files(&self) -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(&self.wallet_dir)
-            .map(|rd| {
-                rd.filter_map(|e| e.ok())
-                    .map(|e| e.path())
-                    .filter(|p| p.extension().map(|x| x == "json").unwrap_or(false))
-                    .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let list = |dir: &PathBuf| -> Vec<String> {
+            std::fs::read_dir(dir)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .map(|e| e.path())
+                        .filter(|p| p.extension().map(|x| x == "json").unwrap_or(false))
+                        .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let mut names = list(&self.wallet_dir);
+        if let Some(b) = &self.bootstrap_wallet_dir {
+            names.extend(list(b));
+        }
         names.sort();
+        names.dedup();
         names
     }
 
@@ -148,7 +159,15 @@ impl Daemon {
         }
         let path = self.wallet_dir.join(format!("{name}.json"));
         if !path.exists() {
-            anyhow::bail!("wallet '{name}' not found");
+            // First load: take Wasabi's file as the starting point; sabid writes only its own copy from here on.
+            match self.bootstrap_wallet_dir.as_ref().map(|b| b.join(format!("{name}.json"))).filter(|p| p.exists()) {
+                Some(src) => {
+                    std::fs::create_dir_all(&self.wallet_dir)?;
+                    std::fs::copy(&src, &path)?;
+                    tracing::info!("wallet {name}: copied {} to {}; Wasabi's file stays untouched", src.display(), path.display());
+                }
+                None => anyhow::bail!("wallet '{name}' not found"),
+            }
         }
         let km = KeyManager::load(&path)?;
         if km.network() != self.network {
@@ -331,9 +350,30 @@ impl Daemon {
     }
 
     /// Background loop: new filters, fee rates, wallet scans.
+    /// Wasabi started while sabid runs: stop coinjoining, let critical phases finish, then exit.
+    async fn wasabi_appeared(&self, what: String) {
+        tracing::error!("Wasabi Wallet started: {what}. {}", crate::wasabi_guard::WARNING);
+        let managers: Vec<_> = self.managers.read().await.values().cloned().collect();
+        for m in &managers {
+            m.stop();
+        }
+        for _ in 0..120 {
+            if managers.iter().all(|m| !*m.in_critical.lock().unwrap()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+        tracing::error!("shutting down because Wasabi Wallet is running");
+        self.shutdown.notify_waiters();
+    }
+
     pub async fn run_sync_loop(self: Arc<Self>) {
         let mut first = true;
         loop {
+            if let Some(w) = crate::wasabi_guard::wasabi_running() {
+                self.wasabi_appeared(w).await;
+                return;
+            }
             match self.update_filters().await {
                 Ok(n) if n > 0 => tracing::info!("{n} new filters"),
                 Ok(_) => {}

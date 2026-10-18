@@ -214,7 +214,16 @@ impl CoinJoinManager {
         let status_client = CoordinatorClient::new(&coordinator, proxy.as_ref(), "satoshi")?;
         let updater = RoundStateUpdater::new(status_client);
         let host = reqwest::Url::parse(&coordinator).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_else(|| "coordinator".into());
-        let prison = Arc::new(CoinPrison::load(crate::config::wasabi_data_dir().join(host).join("PrisonedCoins.json")));
+        let prison_file = daemon.datadir.join(crate::daemon::network_dir_name(daemon.network)).join(&host).join("PrisonedCoins.json");
+        if !prison_file.exists() {
+            // Start from Wasabi's bans for this coordinator; sabid keeps its own file from here on.
+            let theirs = crate::config::wasabi_data_dir().join(&host).join("PrisonedCoins.json");
+            if theirs.exists() {
+                std::fs::create_dir_all(prison_file.parent().unwrap()).ok();
+                std::fs::copy(&theirs, &prison_file).ok();
+            }
+        }
+        let prison = Arc::new(CoinPrison::load(prison_file));
         let m = Arc::new(Self {
             daemon,
             wallet_name: wallet_name.to_string(),

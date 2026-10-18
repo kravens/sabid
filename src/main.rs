@@ -6,6 +6,7 @@ mod methods;
 mod rpc;
 mod secrets;
 mod tor;
+mod wasabi_guard;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -150,6 +151,10 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Daemon { wallets, rpc_bind, no_tor, tor_binary, wallet_dir } => {
+            if let Some(w) = wasabi_guard::wasabi_running() {
+                eprintln!("Wasabi Wallet is running: {w}.\n{}", wasabi_guard::WARNING);
+                std::process::exit(2);
+            }
             std::fs::create_dir_all(&cli.datadir)?;
             let tor_handle = if no_tor || cfg.use_tor.eq_ignore_ascii_case("Disabled") {
                 None
@@ -184,8 +189,14 @@ async fn main() -> anyhow::Result<()> {
             drop(tor_handle);
         }
         Cmd::ImportWasabiTxs { wallet, wallet_dir } => {
-            let wdir = wallet_dir.unwrap_or_else(|| config::wasabi_data_dir().join("Wallets"));
-            let km = wallet::KeyManager::load(&wdir.join(format!("{wallet}.json")))?;
+            // sabid's own copy when it has one, else the file Wasabi keeps.
+            let own = cli.datadir.join("Main/Wallets").join(format!("{wallet}.json"));
+            let path = match wallet_dir {
+                Some(d) => d.join(format!("{wallet}.json")),
+                None if own.exists() => own,
+                None => config::wasabi_data_dir().join("Wallets").join(format!("{wallet}.json")),
+            };
+            let km = wallet::KeyManager::load(&path)?;
             let net_dir = cli.datadir.join("Main");
             let store = wallet::WalletStore::open(&net_dir.join(format!("{wallet}.sqlite")))?;
             let tx_store = config::wasabi_data_dir().join("BitcoinStore/Main/ConfirmedTransactions/2/Transactions.sqlite");

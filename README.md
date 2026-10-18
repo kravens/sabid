@@ -36,8 +36,12 @@ cargo test --workspace
 ## Run
 
 sabid reads `~/.walletwasabi/client/Config.json` (coordinator, RPC credentials and listen prefix,
-Bitcoin Core RPC endpoint and credentials) and the wallets in `~/.walletwasabi/client/Wallets/`.
-It reuses Wasabi's filter index and block cache read-only and keeps its own state in `~/.sabid/`.
+Bitcoin Core RPC endpoint and credentials), Wasabi's filter index, block cache and transaction
+store, all read-only. Everything it writes lives under `~/.sabid/` (`--datadir`): on the first
+load of a wallet its file is copied from `~/.walletwasabi/client/Wallets/` to
+`~/.sabid/Main/Wallets/` and only that copy is updated from then on (key states, labels, device
+settings); the per-coordinator ban list is copied the same way. Wasabi's own files are never
+written. `--wallet-dir` points both reading and writing at a directory of your choice instead.
 
 ```sh
 sabid daemon --wallet MyWallet                      # RPC on the Config.json prefix, 127.0.0.1:37128 by default
@@ -53,7 +57,12 @@ output, status polling) gets its own circuit.
 Bitcoin Core: `BitcoinRpcEndPoint` and `BitcoinRpcCredentialString` from `Config.json`, reached
 over Tor when it is an onion address. Without a node, blocks come from the block cache and P2P.
 
-Do not run sabid and the Wasabi GUI on the same wallet file at the same time: both rewrite it.
+sabid refuses to start while a Wasabi GUI or daemon runs (`wassabee`, `wassabeed`, or `dotnet`
+with their assemblies), and if Wasabi starts later it stops coinjoining, lets a round in its
+critical phase finish, and exits with the same warning: both would register the same coins with
+the coordinator, and Wasabi rewrites the stores sabid reads. Since sabid keeps its own wallet
+copy, Wasabi does not see labels or key states sabid wrote; it rediscovers sabid's coinjoin
+outputs through its gap limit when you open the wallet there again.
 
 Other commands:
 
