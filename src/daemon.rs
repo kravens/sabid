@@ -2,7 +2,8 @@
 
 use crate::config::{wasabi_data_dir, WasabiConfig};
 use bitcoin::Network;
-use std::collections::BTreeMap;
+use bitcoin::hashes::Hash;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -74,6 +75,8 @@ pub struct Daemon {
     pub syncing: std::sync::Mutex<std::collections::HashSet<String>>,
     pub fee_rates: RwLock<BTreeMap<u32, u32>>,
     pub shutdown: tokio::sync::Notify,
+    /// Mempool txids already looked at (`None` until the first poll sets the baseline).
+    pub mempool_seen: std::sync::Mutex<Option<HashSet<bitcoin::Txid>>>,
 }
 
 pub fn network_dir_name(n: Network) -> &'static str {
@@ -129,6 +132,7 @@ impl Daemon {
             syncing: std::sync::Mutex::new(std::collections::HashSet::new()),
             fee_rates: RwLock::new(BTreeMap::new()),
             shutdown: tokio::sync::Notify::new(),
+            mempool_seen: std::sync::Mutex::new(None),
         }))
     }
 
@@ -383,6 +387,50 @@ impl Daemon {
     }
 
     /// Background loop: new filters, fee rates, wallet scans.
+    /// Unconfirmed transactions that pay or spend a loaded wallet, from the node's mempool. The first
+    /// poll only takes a baseline (fetching a whole mempool over Tor is not worth it; those confirm
+    /// soon); later polls fetch what is new. Stored mempool transactions the node no longer has are
+    /// dropped after a grace period (our own coinjoin may take a moment to reach the node).
+    async fn scan_mempool(&self) -> anyhow::Result<()> {
+        let Some(node) = &self.bitcoind else { return Ok(()) };
+        let current: HashSet<bitcoin::Txid> = node.get_raw_mempool().await?.into_iter().collect();
+        let new: Vec<bitcoin::Txid> = match self.mempool_seen.lock().unwrap().as_ref() {
+            None => Vec::new(),
+            Some(prev) => current.difference(prev).copied().collect(),
+        };
+        let txs: Vec<bitcoin::Transaction> = if new.is_empty() { Vec::new() } else { node.get_raw_transactions(&new).await?.into_iter().flatten().collect() };
+        let now = chrono::Utc::now().timestamp();
+        let wallets: Vec<_> = self.wallets.read().await.values().cloned().collect();
+        for w in wallets {
+            let mut lw = w.lock().await;
+            if !lw.loaded {
+                continue;
+            }
+            let scripts: HashSet<bitcoin::ScriptBuf> = lw.km.scripts().into_iter().collect();
+            let ours: HashSet<bitcoin::OutPoint> = lw.state.unspent().map(|c| c.outpoint).collect();
+            let mut changed = false;
+            for tx in &txs {
+                if tx.output.iter().any(|o| scripts.contains(&o.script_pubkey)) || tx.input.iter().any(|i| ours.contains(&i.previous_output)) {
+                    tracing::info!("{}: unconfirmed transaction {} seen in the mempool", lw.km.wallet_name(), tx.compute_txid());
+                    lw.store.insert_tx(tx, wallet::store::MEMPOOL_HEIGHT, &bitcoin::BlockHash::all_zeros(), 0, now)?;
+                    changed = true;
+                }
+            }
+            for (txid, time) in lw.store.mempool_txs()? {
+                if !current.contains(&txid) && now - time > 600 {
+                    tracing::info!("{}: transaction {txid} left the mempool unconfirmed; forgetting it", lw.km.wallet_name());
+                    lw.store.delete_tx(&txid)?;
+                    changed = true;
+                }
+            }
+            if changed {
+                lw.rebuild_state()?;
+            }
+        }
+        *self.mempool_seen.lock().unwrap() = Some(current);
+        Ok(())
+    }
+
     /// Wasabi started while sabid runs: stop coinjoining, let critical phases finish, then exit.
     async fn wasabi_appeared(&self, what: String) {
         tracing::error!("Wasabi Wallet started: {what}. {}", crate::wasabi_guard::WARNING);
@@ -419,6 +467,11 @@ impl Daemon {
             for n in names {
                 if let Err(e) = self.sync_wallet(&n).await {
                     tracing::warn!("sync {n}: {e}");
+                }
+            }
+            if iteration % 4 == 0 {
+                if let Err(e) = self.scan_mempool().await {
+                    tracing::warn!("mempool: {e}");
                 }
             }
             iteration = iteration.wrapping_add(1);

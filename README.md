@@ -19,10 +19,10 @@ design notes and the progress log.
   account over the bridge API), Coldcard Mk4 on the `coinjoin-fw-2` firmware (hidraw, HSM policy).
 - Wasabi-compatible JSON-RPC, a CLI, an MCP server.
 
-Not yet: sending outside coinjoin (`send`, `build`, `broadcast`, `payincoinjoin`), mempool
-scanning for foreign transactions, Passport and Krux, pure-Rust WabiSabi crypto (the vendored C
-library is used through FFI). `startcoinjoinsweep` (coinjoin into another wallet) and the device
-import/enable methods exist but have not run live end to end yet.
+Not yet: sending outside coinjoin (`send`, `build`, `broadcast`, `payincoinjoin`), Passport and
+Krux, pure-Rust WabiSabi crypto (the vendored C library is used through FFI).
+`startcoinjoinsweep` (coinjoin into another wallet) and the device import/enable methods exist
+but have not run live end to end yet.
 
 ## Build
 
@@ -56,7 +56,10 @@ forces a proxy, `--no-tor` is for regtest only. Every coordinator identity (each
 output, status polling) gets its own circuit.
 
 Bitcoin Core: `BitcoinRpcEndPoint` and `BitcoinRpcCredentialString` from `Config.json`, reached
-over Tor when it is an onion address. Without a node, blocks come from the block cache and P2P.
+over Tor when it is an onion address. With a node, unconfirmed transactions that pay or spend a
+loaded wallet are picked up from its mempool every two minutes (transactions already in the
+mempool when sabid starts are only seen once they confirm). Without a node, blocks come from the
+block cache and P2P.
 
 sabid refuses to start while a Wasabi GUI or daemon runs (`wassabee`, `wassabeed`, or `dotnet`
 with their assemblies), and if Wasabi starts later it stops coinjoining, lets a round in its

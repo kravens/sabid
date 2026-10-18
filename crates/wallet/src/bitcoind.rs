@@ -162,6 +162,23 @@ impl Bitcoind {
         deserialize(&raw).map_err(|e| RpcError::Bad(format!("tx: {e}")))
     }
 
+    pub async fn get_raw_mempool(&self) -> Result<Vec<Txid>, RpcError> {
+        let v = self.call("getrawmempool", json!([false])).await?;
+        Ok(v.as_array().map(|a| a.iter().filter_map(|t| t.as_str().and_then(|s| s.parse().ok())).collect()).unwrap_or_default())
+    }
+
+    /// Many `getrawtransaction` in batches; a transaction that left the mempool meanwhile is `None`.
+    pub async fn get_raw_transactions(&self, txids: &[Txid]) -> Result<Vec<Option<Transaction>>, RpcError> {
+        let mut out = Vec::with_capacity(txids.len());
+        for chunk in txids.chunks(100) {
+            let calls: Vec<(&str, Value)> = chunk.iter().map(|t| ("getrawtransaction", json!([t.to_string(), false]))).collect();
+            for r in self.batch(&calls).await? {
+                out.push(r.ok().and_then(|v| hex::decode(v.as_str().unwrap_or("")).ok()).and_then(|raw| deserialize(&raw).ok()));
+            }
+        }
+        Ok(out)
+    }
+
     pub async fn send_raw_transaction(&self, tx_hex: &str) -> Result<Txid, RpcError> {
         let v = self.call("sendrawtransaction", json!([tx_hex])).await?;
         v.as_str().and_then(|s| s.parse().ok()).ok_or_else(|| RpcError::Bad("sendrawtransaction".into()))

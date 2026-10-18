@@ -70,6 +70,20 @@ impl WalletStore {
         Ok(())
     }
 
+    pub fn mempool_txs(&self) -> rusqlite::Result<Vec<(Txid, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut st = conn.prepare("SELECT txid, time FROM txs WHERE height = ?1")?;
+        let rows = st.query_map(params![MEMPOOL_HEIGHT as i64], |r| {
+            let txid: Vec<u8> = r.get(0)?;
+            Ok((Txid::from_slice(&txid).unwrap_or_else(|_| Txid::all_zeros()), r.get::<_, i64>(1)?))
+        })?;
+        rows.collect()
+    }
+
+    pub fn delete_tx(&self, txid: &Txid) -> rusqlite::Result<usize> {
+        self.conn.lock().unwrap().execute("DELETE FROM txs WHERE txid = ?1", params![txid.as_byte_array().to_vec()])
+    }
+
     pub fn rollback_above(&self, height: u32) -> rusqlite::Result<usize> {
         self.conn.lock().unwrap().execute("DELETE FROM txs WHERE height > ?1", params![height as i64])
     }
