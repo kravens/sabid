@@ -8,6 +8,7 @@ pub mod destinations;
 pub mod depgraph;
 pub mod keychain;
 pub mod ownership;
+pub mod payments;
 pub mod round_state;
 pub mod selector;
 pub mod units;

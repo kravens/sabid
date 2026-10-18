@@ -19,8 +19,8 @@ design notes and the progress log.
   account over the bridge API), Coldcard Mk4 on the `coinjoin-fw-2` firmware (hidraw, HSM policy).
 - Wasabi-compatible JSON-RPC, a CLI, an MCP server.
 
-Not yet: sending from a Trezor, payments inside coinjoins (`payincoinjoin`), Passport and Krux,
-pure-Rust WabiSabi crypto (the vendored C library is used through FFI). `send`, the fee bumps, mempool pickup and recovery passed the regtest smoke test;
+Not yet: sending from a Trezor, Passport and Krux, pure-Rust WabiSabi crypto (the vendored C
+library is used through FFI). `send`, the fee bumps, mempool pickup and recovery passed the regtest smoke test;
 `startcoinjoinsweep` and the device import/enable methods have not run end to end yet.
 
 ## Build
@@ -122,6 +122,9 @@ curl -s -u user:pass http://127.0.0.1:37128/MyWallet \
 | `lockwallet` | | erase the decrypted key and stop a running coinjoin after its round |
 | `startcoinjoin` | `[password, stopWhenAllMixed, overridePlebStop]` | empty password uses the unlocked key; device wallets need none |
 | `startcoinjoinsweep` | `[password, outputWalletName]` | coinjoin every coin, private ones too, into another loaded wallet until stopped |
+| `payincoinjoin` | `[address, amount, password]` | soft wallets: queue a payment to ride along as an output of a later round; returns its id |
+| `listpaymentsincoinjoin` | | id, amount, destination script, address, state history (Pending, In progress, Signed, Finished) |
+| `cancelpaymentincoinjoin` | `[paymentId]` | only while pending |
 | `stopcoinjoin` | | takes effect after the critical phase |
 | `enumeratedevices` | | HWI-shaped list: a Coldcard on USB, Trezors on the bridge |
 | `importhardwarewallet` | `[walletName, enableCoinjoin, birthHeight?]` | watch-only file from the connected device (Coldcard must not be in HSM mode); Trezor with coinjoin gets its SLIP-25 account |
@@ -143,9 +146,8 @@ launch `wassabeed` itself, while sabid you start by hand. Flow:
 3. `python3 sabi.py --rpc http://127.0.0.1:37128 --wallet MyWallet`.
 
 sabi's coinjoin dashboard, coin list, history, receive, start/stop and device limits use methods
-sabid has, as do its send tab and the speed-up / cancel actions. Screens that call
-`payincoinjoin` or `listpaymentsincoinjoin` get a "method not found" error from sabid until
-those land (see `PLAN.md`); `wcli.sh` style one-liners work as is.
+sabid has, as do its send tab, the speed-up / cancel actions and the payments-in-coinjoin
+screen; `wcli.sh` style one-liners work as is.
 
 ## MCP
 

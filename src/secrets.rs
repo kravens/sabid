@@ -15,10 +15,11 @@ fn secret_field_name(k: &str) -> bool {
 
 /// Methods an agent may call through the MCP `rpc` tool: nothing that takes a password (soft
 /// wallets are unlocked on the daemon host) and nothing that stops the daemon.
-const AGENT_METHODS: [&str; 27] = [
+const AGENT_METHODS: [&str; 30] = [
     "getstatus", "listwallets", "loadwallet", "selectwallet", "getwalletinfo", "listunspentcoins", "listcoins", "gethistory", "getnewaddress", "listkeys",
     "excludefromcoinjoin", "getfeerates", "startcoinjoin", "startcoinjoinsweep", "stopcoinjoin", "enumeratedevices", "setcoinjoinlimits", "displayaddress", "lockwallet",
     "importhardwarewallet", "enablecoinjoin", "enabletaproot", "build", "send", "broadcast", "canceltransaction", "speeduptransaction",
+    "payincoinjoin", "listpaymentsincoinjoin", "cancelpaymentincoinjoin",
 ];
 
 /// Where a password sits in the methods that take one: positional index, and the object key.
@@ -27,6 +28,7 @@ fn password_slot(method: &str) -> Option<usize> {
         "startcoinjoin" | "startcoinjoinsweep" => Some(0),
         "build" | "send" => Some(4),
         "canceltransaction" | "speeduptransaction" => Some(1),
+        "payincoinjoin" => Some(2),
         _ => None,
     }
 }

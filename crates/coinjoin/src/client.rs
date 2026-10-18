@@ -147,6 +147,8 @@ pub struct CoinJoinClient {
     pub input_verifier: Option<InputVerifier>,
     pub do_not_register_in_last_minute: Duration,
     pub min_anon_score_for_payments: i32,
+    /// Payments to embed in rounds (`PaymentAwareOutputProvider`); none for device wallets.
+    pub payments: Option<Arc<crate::payments::PaymentBatch>>,
     pub progress: mpsc::UnboundedSender<Progress>,
     pub coins_in_critical_phase: Mutex<Vec<CjCoin>>,
     pub coins_banned: Mutex<HashSet<OutPoint>>,
@@ -668,7 +670,7 @@ impl CoinJoinClient {
         if let Some(v) = &self.input_verifier {
             v(theirs.clone()).await.map_err(|m| CjError::client(CoinjoinError::CoordinatorLiedAboutInputs, m))?;
         }
-        let outputs = self.get_outputs(&p, &registered_effective, &their_effective, available_vsizes.iter().sum())?;
+        let outputs = self.get_outputs(&round.id, &p, &registered_effective, &their_effective, available_vsizes.iter().sum())?;
         let inputs: Vec<(i64, i64)> = alices.iter().zip(&available_vsizes).map(|(a, v)| (a.effective_value(), *v)).collect();
         let out_values: Vec<(i64, i64)> = outputs.iter().map(|o| (effective_cost(o.value.to_sat() as i64, &o.script_pubkey, fee_rate), script_output_vsize(&o.script_pubkey))).collect();
         if inputs.iter().any(|(a, _)| *a <= 0) {
@@ -708,22 +710,61 @@ impl CoinJoinClient {
         Ok(outputs)
     }
 
-    /// `OutputProvider.GetOutputs`
-    fn get_outputs(&self, p: &wasabi_proto::RoundParameters, registered_effective: &[i64], their_effective: &[i64], available_vsize: i64) -> Result<Vec<TxOut>, CjError> {
+    /// `PaymentAwareOutputProvider.GetOutputs`: the best set of pending payments first, then the
+    /// remaining value decomposed as usual.
+    fn get_outputs(&self, round_id: &str, p: &wasabi_proto::RoundParameters, registered_effective: &[i64], their_effective: &[i64], available_vsize: i64) -> Result<Vec<TxOut>, CjError> {
         let fee_rate = FeeRate::from_fee_per_k(p.mining_fee_rate);
         let supported = self.destinations.supported_script_types();
         let out_types: Vec<ScriptType> = p.allowed_output_types.iter().filter_map(|t| ScriptType::from_u8(*t)).collect();
         let min_reasonable = min_reasonable_output_amount(&out_types, &supported, fee_rate, p.allowed_output_amounts.min);
         let mut rng = rand::thread_rng();
+        let mut outs = Vec::new();
+        let mut available_vsize = available_vsize;
+        let mut to_decompose: Vec<i64> = registered_effective.to_vec();
+        let mut paying = false;
+        if let Some(batch) = &self.payments {
+            let set = batch.best_set(to_decompose.iter().sum(), available_vsize, &out_types, p.allowed_output_amounts.min, p.allowed_output_amounts.max, fee_rate);
+            if !set.is_empty() {
+                let total: i64 = set.iter().map(|pm| effective_cost(pm.amount, &pm.script, fee_rate)).sum();
+                available_vsize -= set.iter().map(|pm| script_output_vsize(&pm.script)).sum::<i64>();
+                for pm in &set {
+                    tracing::info!("round {}: paying {} sat to {} inside the coinjoin (payment {})", &round_id[..round_id.len().min(8)], pm.amount, pm.script, pm.id);
+                    outs.push(TxOut { value: Amount::from_sat(pm.amount as u64), script_pubkey: pm.script.clone() });
+                }
+                batch.move_in_progress(&set.iter().map(|pm| pm.id.clone()).collect::<Vec<_>>(), round_id);
+                // Take the largest registered values that cover the payments out of the decomposer's
+                // view; what they overshoot by comes back as one virtual value.
+                let remaining_amount = to_decompose.iter().sum::<i64>() - total;
+                to_decompose.sort_by(|a, b| b.cmp(a));
+                let mut acc = 0;
+                let mut used = 0;
+                for v in &to_decompose {
+                    if acc > total {
+                        break;
+                    }
+                    acc += v;
+                    used += 1;
+                }
+                let mut rest: Vec<i64> = to_decompose[used..].to_vec();
+                let overshoot = remaining_amount - rest.iter().sum::<i64>();
+                if overshoot > 0 {
+                    rest.push(overshoot);
+                }
+                to_decompose = rest;
+                paying = true;
+            }
+        }
+        if to_decompose.iter().sum::<i64>() <= 0 {
+            return Ok(outs);
+        }
         let decomposer = AmountDecomposer::new(fee_rate, min_reasonable, p.allowed_output_amounts.max, available_vsize, supported.clone(), &mut rng);
         let mut all: Vec<i64> = their_effective.to_vec();
         all.extend_from_slice(registered_effective);
-        let values: Vec<Output> = decomposer.decompose(registered_effective.iter().sum(), &all, false, &mut rng)?;
+        let values: Vec<Output> = decomposer.decompose(to_decompose.iter().sum(), &all, paying, &mut rng)?;
         let taproot_count = values.iter().filter(|o| o.script_type == ScriptType::Taproot).count();
         let segwit_count = values.iter().filter(|o| o.script_type == ScriptType::P2WPKH).count();
         let mut taproot = self.destinations.next_destinations(taproot_count, true);
         let mut segwit = self.destinations.next_destinations(segwit_count, false);
-        let mut outs = Vec::with_capacity(values.len());
         for o in values {
             let script = if o.script_type == ScriptType::Taproot { taproot.pop() } else { segwit.pop() }.ok_or_else(|| CjError::Other("not enough destinations".into()))?;
             outs.push(TxOut { value: Amount::from_sat(o.amount as u64), script_pubkey: script });

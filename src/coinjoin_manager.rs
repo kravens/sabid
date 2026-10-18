@@ -167,6 +167,8 @@ pub struct CoinJoinManager {
     pub liquidity_clue: Arc<Mutex<Option<i64>>>,
     pub trezor: Mutex<Option<Arc<hw::TrezorKeyChain>>>,
     pub coldcard: Mutex<Option<Arc<hw::ColdcardKeyChain>>>,
+    /// Payments waiting to ride along in a round (`payincoinjoin`).
+    pub payments: Arc<coinjoin::payments::PaymentBatch>,
 }
 
 pub const PLEB_STOP_DEFAULT_SATS: i64 = 1_000_000;
@@ -256,6 +258,7 @@ impl CoinJoinManager {
             in_critical: std::sync::Mutex::new(false),
             last_error: std::sync::Mutex::new(None),
             output_wallet: std::sync::Mutex::new(None),
+            payments: Arc::new(coinjoin::payments::PaymentBatch::new()),
             updater: updater.clone(),
             updater_stop: Arc::new(Notify::new()),
             prison,
@@ -484,13 +487,14 @@ impl CoinJoinManager {
     /// One round attempt. `Ok(true)` = keep going, `Ok(false)` = done (all mixed, stop requested).
     async fn run_once(self: &Arc<Self>, key_chain: Arc<dyn KeyChain>, cancel: CancellationToken) -> Result<bool, String> {
         let d = &self.daemon;
-        let (anon_target, non_private_isolation, only_private_payments, pleb_stop) = {
+        let (anon_target, non_private_isolation, only_private_payments, pleb_stop, hardware_wallet) = {
             let w = self.wallet.lock().await;
             (
                 w.km.i64_field("AnonScoreTarget", 10) as i32,
                 w.km.bool_field("RedCoinIsolation", false),
                 w.km.bool_field("OnlyUsePrivateFundsForPayments", false),
                 w.km.str_field("PlebStopThreshold").and_then(|s| s.parse::<f64>().ok()).map(|b| (b * 1e8) as i64).unwrap_or(PLEB_STOP_DEFAULT_SATS),
+                w.km.is_hardware_wallet(),
             )
         };
         let (candidates, reasons) = {
@@ -507,7 +511,8 @@ impl CoinJoinManager {
         }
         let output_wallet = self.output_wallet.lock().unwrap().clone();
         let consolidation = output_wallet.is_some();
-        if !consolidation && candidates.iter().all(|c| c.is_private(anon_target)) {
+        let payments_pending = self.payments.any_pending();
+        if !consolidation && !payments_pending && candidates.iter().all(|c| c.is_private(anon_target)) {
             if *self.stop_when_all_mixed.lock().unwrap() {
                 tracing::info!("{}: all coins are private, stopping.", self.wallet_name);
                 return Ok(false);
@@ -523,7 +528,7 @@ impl CoinJoinManager {
             key_chain: key_chain.clone(),
             destinations: Arc::new(WalletDestinations { wallet: output_wallet.clone().unwrap_or_else(|| self.wallet.clone()) }),
             updater: self.updater.clone(),
-            selector: CoinJoinCoinSelector::new(consolidation, anon_target, non_private_isolation, false),
+            selector: CoinJoinCoinSelector::new(consolidation, anon_target, non_private_isolation, payments_pending),
             config: CoinJoinConfig {
                 coordinator_identifier: d.cfg.coordinator_identifier.clone(),
                 max_mining_fee_rate_sat_vb: key_chain.max_mining_fee_rate().map(|f| f.sat_per_vb()).unwrap_or(d.cfg.max_coin_join_mining_fee_rate).min(d.cfg.max_coin_join_mining_fee_rate),
@@ -562,6 +567,7 @@ impl CoinJoinManager {
             }),
             do_not_register_in_last_minute: std::time::Duration::from_secs(60),
             min_anon_score_for_payments: if only_private_payments { anon_target } else { 0 },
+            payments: if hardware_wallet { None } else { Some(self.payments.clone()) },
             progress: tx,
             coins_in_critical_phase: Mutex::new(Vec::new()),
             coins_banned: Mutex::new(HashSet::new()),
@@ -579,6 +585,7 @@ impl CoinJoinManager {
                         me.set_state(CoinJoinClientState::InProgress);
                     }
                     Progress::CoinBanned { outpoint, until } => me.prison.ban(*outpoint, *until),
+                    Progress::TransactionSigned { txid, .. } => me.payments.move_signed(*txid),
                     _ => {}
                 }
                 tracing::info!("{}: {:?}", me.wallet_name, p);
@@ -599,6 +606,7 @@ impl CoinJoinManager {
         let _ = progress_task.await;
         match result {
             Ok(CoinJoinResult::Success { output_scripts, unsigned_tx, costs, .. }) => {
+                self.payments.move_finished(unsigned_tx.compute_txid());
                 tracing::info!("{}: coinjoin finished, transaction {} was broadcast (mining fee {} sat, dust {} sat)", self.wallet_name, unsigned_tx.compute_txid(), costs.mining_fee, costs.wasted_dust);
                 let now = chrono::Utc::now().timestamp();
                 // The spending wallet, and the output wallet when sweeping somewhere else.
@@ -621,10 +629,12 @@ impl CoinJoinManager {
                 Ok(true)
             }
             Ok(CoinJoinResult::Failed) => {
+                self.payments.move_pending();
                 tracing::info!("{}: coinjoin round failed, will retry.", self.wallet_name);
                 Ok(true)
             }
             Err(CjError::Cancelled) => {
+                self.payments.move_pending();
                 // The user's stop cancels the parent token; a round timeout only cancels a child.
                 Ok(!cancel.is_cancelled() && self.cancel.lock().unwrap().as_ref().map(|c| !c.is_cancelled()).unwrap_or(false))
             }
@@ -639,7 +649,10 @@ impl CoinJoinManager {
                 w.km.save().ok();
                 Ok(true)
             }
-            Err(e) => Err(e.to_string()),
+            Err(e) => {
+                self.payments.move_pending();
+                Err(e.to_string())
+            }
         }
     }
 }

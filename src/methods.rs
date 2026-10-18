@@ -398,6 +398,64 @@ pub async fn call(ctx: &Ctx, method: &str, p: Params) -> Result<Value, RpcError>
             d.note_broadcast(&tx).await;
             Ok(json!({"txid": txid.to_string()}))
         }
+        "payincoinjoin" => {
+            // Wasabi: the payment rides along in a later round as one of its outputs. Soft wallets only:
+            // a signing device approves how much may leave, never where to, so it refuses such rounds.
+            let name = ctx.wallet_name.clone().ok_or_else(|| RpcError::internal("Wallet name is invalid or not allowed."))?;
+            let addr = p.str(0, "address")?;
+            let script = addr.parse::<bitcoin::Address<_>>().map_err(|e| RpcError::invalid_params(format!("address: {e}")))?.require_network(d.network).map_err(|e| RpcError::invalid_params(e.to_string()))?.script_pubkey();
+            let amount = match p.get(1, "amount") {
+                Some(Value::Number(n)) => n.as_i64().ok_or_else(|| RpcError::invalid_params("amount"))?,
+                Some(Value::String(s)) => (s.parse::<f64>().map_err(|_| RpcError::invalid_params("amount"))? * 1e8).round() as i64,
+                _ => return Err(RpcError::invalid_params("missing parameter 'amount' (satoshis)")),
+            };
+            if amount <= 0 {
+                return Err(RpcError::invalid_params("amount must be positive"));
+            }
+            let password = p.str_opt(2, "password");
+            let w = ctx.wallet().await?;
+            if w.lock().await.km.is_hardware_wallet() {
+                return Err(RpcError::internal("Payments in coinjoin are not possible when a device signs the rounds."));
+            }
+            // The same check Wasabi makes: the password (or the unlocked key) must open the wallet.
+            crate::coinjoin_manager::soft_key_chain(&w, password, &name).await.map_err(RpcError::internal)?;
+            let m = d.manager(&name).await.map_err(RpcError::internal)?;
+            Ok(Value::String(m.payments.add(script, amount)))
+        }
+        "listpaymentsincoinjoin" => {
+            let name = ctx.wallet_name.clone().ok_or_else(|| RpcError::internal("Wallet name is invalid or not allowed."))?;
+            let Some(m) = d.managers.read().await.get(&name).cloned() else { return Ok(Value::Array(vec![])) };
+            Ok(Value::Array(
+                m.payments
+                    .list()
+                    .into_iter()
+                    .map(|pm| {
+                        use coinjoin::payments::PaymentState as S;
+                        // Newest state first, as Wasabi walks the chain of previous states.
+                        let states: Vec<Value> = pm
+                            .states
+                            .iter()
+                            .rev()
+                            .map(|s| match s {
+                                S::Pending => json!({"status": "Pending"}),
+                                S::InProgress { round_id } => json!({"status": "In progress", "round": round_id}),
+                                S::Signed { txid } => json!({"status": "Signed", "txid": txid.to_string()}),
+                                S::Finished { txid } => json!({"status": "Finished", "txid": txid.to_string()}),
+                            })
+                            .collect();
+                        let address = bitcoin::Address::from_script(&pm.script, d.network).map(|a| a.to_string()).unwrap_or_default();
+                        json!({"id": pm.id, "amount": pm.amount, "destination": hex::encode(pm.script.as_bytes()), "state": states, "address": address})
+                    })
+                    .collect(),
+            ))
+        }
+        "cancelpaymentincoinjoin" => {
+            let name = ctx.wallet_name.clone().ok_or_else(|| RpcError::internal("Wallet name is invalid or not allowed."))?;
+            let id = p.str(0, "paymentId")?;
+            let m = d.managers.read().await.get(&name).cloned().ok_or_else(|| RpcError::internal("Payment was not found."))?;
+            m.payments.abort(&id).map_err(RpcError::internal)?;
+            Ok(Value::Null)
+        }
         "stopcoinjoin" => {
             let name = ctx.wallet_name.clone().ok_or_else(|| RpcError::internal("Wallet name is invalid or not allowed."))?;
             if let Some(m) = d.managers.read().await.get(&name) {
