@@ -273,7 +273,7 @@ impl KeyManager {
         self.raw.insert("ExcludedCoinsFromCoinJoin".into(), Value::Array(arr));
     }
 
-    fn position_of(&self, script: &ScriptBuf) -> Option<usize> {
+    pub fn position_of(&self, script: &ScriptBuf) -> Option<usize> {
         if self.index.len() == self.keys.len() {
             self.index.get(script).copied()
         } else {

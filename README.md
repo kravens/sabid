@@ -66,7 +66,10 @@ or a Tailscale/VPN range (a first scan downloads every block the filters flag, o
 old wallet, so a direct path to the node matters more than anything else). With a node, unconfirmed transactions that pay or spend a
 loaded wallet are picked up from its mempool every two minutes (transactions already in the
 mempool when sabid starts are only seen once they confirm). Without a node, blocks come from the
-block cache and P2P.
+block cache and P2P: a fresh Tor circuit per peer, a Core-style version/verack handshake
+(protocol 70016, no services, transaction relay off), one `getdata` for the block without witness
+data (a wallet scan needs outputs and outpoints only; the header hash and merkle root still
+authenticate it), pruned peers refused, and the connection closed right after.
 
 sabid refuses to start while a Wasabi GUI or daemon runs (`wassabee`, `wassabeed`, or `dotnet`
 with their assemblies), and if Wasabi starts later it stops coinjoining, lets a round in its

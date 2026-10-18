@@ -1,6 +1,6 @@
 [package]
 name = "wallet"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 license = "MIT"
 description = "Wasabi-compatible wallet: KeyManager wallet files, BIP158 sync over bitcoind, coins and history"

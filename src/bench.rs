@@ -93,6 +93,7 @@ pub async fn rpc(base: &str, user: &str, password: &str, wallet: &str, n: usize)
             Ok::<f64, anyhow::Error>(t.elapsed().as_secs_f64() * 1e3)
         }
     };
+    let n = n.max(1);
     for (method, scoped) in [("getstatus", false), ("getwalletinfo", true), ("listunspentcoins", true), ("gethistory", true)] {
         let mut ms = Vec::with_capacity(n);
         for _ in 0..n {

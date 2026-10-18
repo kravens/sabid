@@ -27,8 +27,9 @@ pub struct Bitcoind {
 /// Private, link-local and CGNAT (Tailscale's 100.64/10) addresses and local names are not routable
 /// from Tor exits; everything else, onion services above all, goes through the proxy.
 pub fn needs_proxy(url: &str) -> bool {
-    let host = url.split("://").nth(1).unwrap_or(url).split('/').next().unwrap_or("").rsplit_once(':').map(|(h, _)| h).unwrap_or("").trim_matches(|c| c == '[' || c == ']');
-    if host.ends_with(".onion") {
+    let parsed = reqwest::Url::parse(url).ok();
+    let host = parsed.as_ref().and_then(|u| u.host_str()).unwrap_or("").trim_matches(|c| c == '[' || c == ']');
+    if host.is_empty() || host.ends_with(".onion") {
         return true;
     }
     if host == "localhost" || host.ends_with(".local") || host.ends_with(".ts.net") {
@@ -237,10 +238,10 @@ mod tests {
     use super::needs_proxy;
     #[test]
     fn local_lan_and_tailscale_nodes_skip_tor() {
-        for direct in ["http://127.0.0.1:8332", "http://localhost:8332", "http://192.168.1.10:8332", "http://10.0.0.5:8332", "http://100.110.11.82:8332", "http://[::1]:8332", "http://btip.tail1234.ts.net:8332"] {
+        for direct in ["http://127.0.0.1:8332", "http://127.0.0.1", "http://user:pass@127.0.0.1:8332", "http://localhost:8332", "http://192.168.1.10:8332", "http://10.0.0.5:8332", "http://100.110.11.82:8332", "http://[::1]:8332", "http://btip.tail1234.ts.net:8332"] {
             assert!(!needs_proxy(direct), "{direct}");
         }
-        for proxied in ["http://abcdefghijklmnop.onion:8332", "http://1.2.3.4:8332", "http://node.example.com:8332", "http://100.200.1.1:8332"] {
+        for proxied in ["http://abcdefghijklmnop.onion:8332", "http://1.2.3.4:8332", "http://node.example.com:8332", "http://100.200.1.1:8332", "not a url"] {
             assert!(needs_proxy(proxied), "{proxied}");
         }
     }

@@ -226,7 +226,9 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Daemon { wallets, rpc_bind, no_tor, tor_binary, wallet_dir } => {
-            if let Some(w) = wasabi_guard::wasabi_running() {
+            // Only mainnet shares files and a coordinator with a running Wasabi.
+            if network == bitcoin::Network::Bitcoin && wasabi_guard::wasabi_running().is_some() {
+                let w = wasabi_guard::wasabi_running().unwrap_or_default();
                 eprintln!("Wasabi Wallet is running: {w}.\n{}", wasabi_guard::WARNING);
                 std::process::exit(2);
             }
@@ -338,8 +340,9 @@ async fn main() -> anyhow::Result<()> {
                     node_pool: Vec::new(),
                     next_slot: std::sync::atomic::AtomicUsize::new(0),
                     p2p: socks.as_deref().map(|s| wallet::p2p::P2pBlockFetcher::new(s, network)).filter(|p| p.has_peers()),
+                    fetch_limit: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
                 }
-                .with_node_pool();
+                .with_node_pool_of(concurrency);
                 let store = wallet::filters::FilterStore::open(Some(&config::wasabi_data_dir().join("BitcoinStore").join(net_dir).join("IndexStore/IndexStore.sqlite")), &own_net_dir.join("filters.sqlite"))?;
                 let tip = store.tip_height().unwrap_or(0);
                 let start = from.unwrap_or_else(|| wallet::filters::first_height(network) + rand::random::<u32>() % tip.saturating_sub(wallet::filters::first_height(network) + blocks as u32).max(1));

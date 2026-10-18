@@ -2,7 +2,7 @@
 //! for blocks that are neither cached nor obtainable from the user's node.
 
 use bitcoin::consensus::encode::{deserialize_partial, serialize};
-use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
+use bitcoin::p2p::message::{CommandString, NetworkMessage, RawNetworkMessage};
 use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::{Address, Magic, ServiceFlags};
@@ -111,9 +111,17 @@ async fn read_msg(stream: &mut TcpStream) -> anyhow::Result<NetworkMessage> {
     buf.extend_from_slice(&header);
     buf.resize(24 + len, 0);
     stream.read_exact(&mut buf[24..]).await?;
-    // Some peers pad messages (version with extra fields, addrv2 variants): take what decodes.
-    let (raw, _consumed): (RawNetworkMessage, usize) = deserialize_partial(&buf)?;
-    Ok(raw.into_payload())
+    let command = String::from_utf8_lossy(&header[4..16]).trim_end_matches('\0').to_string();
+    match deserialize_partial::<RawNetworkMessage>(&buf) {
+        Ok((raw, _)) => Ok(raw.into_payload()),
+        // Only the messages the fetch acts on have to decode; anything else a peer sends
+        // (alerts, address gossip in new formats) is skipped.
+        Err(e) if !matches!(command.as_str(), "version" | "verack" | "block" | "notfound" | "ping") => {
+            tracing::trace!("p2p: skipping undecodable {command} ({len} bytes): {e}");
+            Ok(NetworkMessage::Unknown { command: CommandString::try_from_static("skipped")?, payload: Vec::new() })
+        }
+        Err(e) => Err(anyhow::anyhow!("{command} ({len} bytes): {e}")),
+    }
 }
 
 async fn fetch_from_peer(socks: &str, peer: &str, magic: Magic, hash: &BlockHash) -> anyhow::Result<Block> {
@@ -126,21 +134,29 @@ async fn fetch_from_peer(socks: &str, peer: &str, magic: Magic, hash: &BlockHash
     let mut stream = proxied.into_inner();
     let dummy = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() as i64;
-    let version = VersionMessage::new(
+    let mut version = VersionMessage::new(
         ServiceFlags::NONE,
         now,
         Address::new(&dummy, ServiceFlags::NONE),
         Address::new(&dummy, ServiceFlags::NONE),
         rand::thread_rng().next_u64(),
-        "/sabid:0.1.0/".to_string(),
+        concat!("/sabid:", env!("CARGO_PKG_VERSION"), "/").to_string(),
         0,
     );
+    // Current Core protocol version. Below 70013 Core still pushes the final `alert` message;
+    // `relay` stays false (BIP 37): no transaction announcements for a block fetch.
+    version.version = 70016;
     write_msg(&mut stream, magic, NetworkMessage::Version(version)).await?;
     let mut got_version = false;
     let mut got_verack = false;
     while !(got_version && got_verack) {
         match read_msg(&mut stream).await? {
-            NetworkMessage::Version(_) => {
+            NetworkMessage::Version(v) => {
+                // A pruned peer (NODE_NETWORK_LIMITED only) serves the last 288 blocks and
+                // disconnects on older requests: not a source for a wallet scan.
+                if !v.services.has(ServiceFlags::NETWORK) {
+                    anyhow::bail!("peer is pruned");
+                }
                 got_version = true;
                 write_msg(&mut stream, magic, NetworkMessage::Verack).await?;
             }
@@ -148,14 +164,17 @@ async fn fetch_from_peer(socks: &str, peer: &str, magic: Magic, hash: &BlockHash
             _ => {}
         }
     }
-    write_msg(&mut stream, magic, NetworkMessage::GetData(vec![Inventory::WitnessBlock(*hash)])).await?;
+    // A scan only needs outputs and outpoints, never witnesses: MSG_BLOCK (no witness data) is a
+    // quarter to a half smaller than MSG_WITNESS_BLOCK. The header hash and the merkle root over
+    // the txids still authenticate everything used.
+    write_msg(&mut stream, magic, NetworkMessage::GetData(vec![Inventory::Block(*hash)])).await?;
     loop {
         match read_msg(&mut stream).await? {
             NetworkMessage::Block(b) => {
                 if b.block_hash() != *hash {
                     anyhow::bail!("peer sent the wrong block");
                 }
-                if !b.check_merkle_root() || !b.check_witness_commitment() {
+                if !b.check_merkle_root() {
                     anyhow::bail!("peer sent an invalid block");
                 }
                 return Ok(b);

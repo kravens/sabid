@@ -25,6 +25,8 @@ pub struct BlockSource {
     pub node_pool: Vec<Bitcoind>,
     pub next_slot: AtomicUsize,
     pub p2p: Option<crate::p2p::P2pBlockFetcher>,
+    /// Fetches in flight across every scan of the daemon.
+    pub fetch_limit: Arc<Semaphore>,
 }
 
 /// Blocks in flight at once during a scan, each on its own Tor circuit to the node. Measured on
@@ -35,10 +37,16 @@ pub const FETCH_SLOTS: usize = 4;
 pub const MATCH_THREADS: usize = 8;
 
 impl BlockSource {
-    pub fn with_node_pool(mut self) -> Self {
+    pub fn with_node_pool(self) -> Self {
+        self.with_node_pool_of(FETCH_SLOTS)
+    }
+
+    /// `n` node identities (Tor circuits) and `n` fetches in flight.
+    pub fn with_node_pool_of(mut self, n: usize) -> Self {
         if let Some(node) = &self.bitcoind {
-            self.node_pool = (0..FETCH_SLOTS as u32).filter_map(|i| node.with_identity(i).ok()).collect();
+            self.node_pool = (0..n.max(1) as u32).filter_map(|i| node.with_identity(i).ok()).collect();
         }
+        self.fetch_limit = Arc::new(Semaphore::new(n.max(1)));
         self
     }
 
@@ -86,8 +94,9 @@ pub struct ScanReport {
     pub to: u32,
     pub matched_blocks: u32,
     pub new_txs: u32,
-    /// Keys were derived past the gap: filters matched ahead of this batch did not see them.
-    pub keys_changed: bool,
+    /// Keys were derived past the gap at this height: the rest of the batch and everything matched
+    /// ahead did not see them, so the scan resumes right after this block with the new scripts.
+    pub keys_changed_at: Option<u32>,
 }
 
 /// Where a wallet scan starts: the store's synced height + 1, or the wallet's birth height.
@@ -142,11 +151,11 @@ pub fn match_filters_with(scripts: &[ScriptBuf], rows: &[FilterRow], threads: us
     Ok(matched)
 }
 
-/// Phase 2 (no locks, network): the matched blocks. `limit` caps the fetches in flight across
-/// every batch of a scan, so a pipelined scan keeps all slots busy without flooding Tor.
-pub async fn fetch_blocks(blocks: &BlockSource, rows: &[FilterRow], matched: &[usize], limit: Arc<Semaphore>) -> anyhow::Result<Vec<(usize, Block)>> {
+/// Phase 2 (no locks, network): the matched blocks, within the source's shared fetch limit so
+/// concurrent scans together keep the slots busy without flooding Tor.
+pub async fn fetch_blocks(blocks: &BlockSource, rows: &[FilterRow], matched: &[usize]) -> anyhow::Result<Vec<(usize, Block)>> {
     let futs = matched.to_vec().into_iter().map(|i| {
-        let limit = limit.clone();
+        let limit = blocks.fetch_limit.clone();
         async move {
             let _permit = limit.acquire().await?;
             blocks.get(&rows[i].block_hash).await.map(|b| (i, b))
@@ -157,12 +166,12 @@ pub async fn fetch_blocks(blocks: &BlockSource, rows: &[FilterRow], matched: &[u
     Ok(out)
 }
 
-/// Block fetch throughput through the configured sources: `count` blocks at `concurrency`.
+/// Block fetch throughput through the configured sources: `count` blocks, as many in flight as
+/// the source allows (`with_node_pool_of`).
 pub async fn bench_fetch(blocks: &BlockSource, hashes: &[BlockHash], concurrency: usize) -> anyhow::Result<(f64, f64)> {
-    let limit = Arc::new(Semaphore::new(concurrency.max(1)));
     let t = std::time::Instant::now();
     let futs = hashes.to_vec().into_iter().map(|h| {
-        let limit = limit.clone();
+        let limit = blocks.fetch_limit.clone();
         async move {
             let _permit = limit.acquire().await?;
             blocks.get(&h).await.map(|b| bitcoin::consensus::encode::serialize(&b).len())
@@ -171,6 +180,37 @@ pub async fn bench_fetch(blocks: &BlockSource, hashes: &[BlockHash], concurrency
     let sizes: Vec<usize> = futures_util::stream::iter(futs).buffer_unordered(concurrency.max(1)).try_collect().await?;
     let secs = t.elapsed().as_secs_f64();
     Ok((hashes.len() as f64 / secs, sizes.iter().sum::<usize>() as f64 / 1e6 / secs))
+}
+
+/// `match_filters` for an async caller: chunks go to tokio's blocking pool (reused threads, no
+/// per-batch thread and allocator-arena churn).
+pub async fn match_filters_async(scripts: Arc<Vec<ScriptBuf>>, rows: Arc<Vec<FilterRow>>) -> anyhow::Result<Vec<usize>> {
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(MATCH_THREADS).max(1);
+    let chunk = rows.len().div_ceil(threads).max(1);
+    let mut tasks = Vec::new();
+    for c in 0..threads {
+        let (start, end) = (c * chunk, ((c + 1) * chunk).min(rows.len()));
+        if start >= end {
+            break;
+        }
+        let (scripts, rows) = (scripts.clone(), rows.clone());
+        tasks.push(tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<usize>> {
+            let mut matched = Vec::new();
+            for (j, row) in rows[start..end].iter().enumerate() {
+                let reader = BlockFilterReader::new(&row.block_hash);
+                if reader.match_any(&mut &row.filter[..], &mut scripts.iter().map(|s| s.as_bytes()))? {
+                    matched.push(start + j);
+                }
+            }
+            Ok(matched)
+        }));
+    }
+    let mut matched = Vec::new();
+    for t in tasks {
+        matched.extend(t.await??);
+    }
+    matched.sort_unstable();
+    Ok(matched)
 }
 
 /// The wallet's own unspent-or-not outpoints known so far, to recognise spends while scanning.
@@ -194,6 +234,7 @@ pub fn process_batch(km: &mut KeyManager, store: &WalletStore, rows: &[FilterRow
     let mut keys_changed = false;
     let mut next = first.height;
     let mut block_iter = blocks.iter().peekable();
+    let mut synced_here = false;
     for (i, row) in rows.iter().enumerate() {
         if row.height != next {
             anyhow::bail!("filter store has a gap at height {next} (got {})", row.height);
@@ -220,16 +261,22 @@ pub fn process_batch(km: &mut KeyManager, store: &WalletStore, rows: &[FilterRow
                 }
             }
         }
-        if i + 1 == rows.len() {
-            store.set_synced(row.height, &row.block_hash)?;
-        }
         report.to = row.height;
         next = row.height + 1;
+        if keys_changed {
+            // New keys from here on: later rows of this batch were matched without them.
+            store.set_synced(row.height, &row.block_hash)?;
+            synced_here = true;
+            km.ensure_gap();
+            km.save().ok();
+            report.keys_changed_at = Some(row.height);
+            break;
+        }
     }
-    if keys_changed {
-        km.ensure_gap();
-        km.save().ok();
-        report.keys_changed = true;
+    if !synced_here {
+        if let Some(last) = rows.last() {
+            store.set_synced(last.height, &last.block_hash)?;
+        }
     }
     Ok((next, report))
 }

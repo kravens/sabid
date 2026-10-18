@@ -4,7 +4,8 @@
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub fn setup() {
-    // SAFETY: mallopt only sets allocator tunables; called once at startup before any threads.
+    // SAFETY: mallopt is thread-safe and only sets an allocator tunable; arenas created before
+    // this call keep existing, which is fine (the cap applies to the ones created afterwards).
     unsafe {
         libc::mallopt(libc::M_ARENA_MAX, 4);
     }

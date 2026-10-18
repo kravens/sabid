@@ -25,6 +25,8 @@ pub struct LoadedWallet {
     pub last_error: Option<String>,
     /// Decrypted master key of a soft wallet and its wall-clock expiry (`unlockwallet`).
     pub unlocked: Option<(bitcoin::bip32::Xpriv, std::time::SystemTime)>,
+    /// Every outpoint ever paid to this wallet (from `rebuild_state`), so a scan recognises spends.
+    pub own_outpoints: HashSet<bitcoin::OutPoint>,
 }
 
 impl LoadedWallet {
@@ -50,6 +52,7 @@ impl LoadedWallet {
     pub fn rebuild_state(&mut self) -> anyhow::Result<()> {
         let txs = self.store.all_txs()?;
         let (state, changed) = WalletState::build(&txs, &mut self.km);
+        self.own_outpoints = state.coins.iter().map(|c| c.outpoint).collect();
         self.state = state;
         if changed || self.km.ensure_gap() {
             self.km.save()?;
@@ -78,6 +81,8 @@ pub struct Daemon {
     pub syncing: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Wallet scans run two at a time: more only share the same block bandwidth and show no progress.
     pub scan_slots: tokio::sync::Semaphore,
+    /// Bumped by a reorg rollback; a scan batch read under an older epoch is thrown away.
+    pub chain_epoch: std::sync::atomic::AtomicU64,
     pub fee_rates: RwLock<BTreeMap<u32, u32>>,
     pub shutdown: tokio::sync::Notify,
     /// Mempool txids already looked at (`None` until the first poll sets the baseline).
@@ -119,6 +124,7 @@ impl Daemon {
             bitcoind: bitcoind.clone(),
             node_pool: Vec::new(),
             next_slot: std::sync::atomic::AtomicUsize::new(0),
+            fetch_limit: Arc::new(tokio::sync::Semaphore::new(1)),
             p2p: socks.as_deref().map(|s| wallet::p2p::P2pBlockFetcher::new(s, network)).filter(|p| p.has_peers()),
         }
         .with_node_pool();
@@ -139,6 +145,7 @@ impl Daemon {
             node_height: RwLock::new(None),
             syncing: std::sync::Mutex::new(std::collections::HashSet::new()),
             scan_slots: tokio::sync::Semaphore::new(2),
+            chain_epoch: std::sync::atomic::AtomicU64::new(0),
             fee_rates: RwLock::new(BTreeMap::new()),
             shutdown: tokio::sync::Notify::new(),
             mempool_seen: std::sync::Mutex::new(None),
@@ -221,7 +228,7 @@ impl Daemon {
             anyhow::bail!("wallet '{name}' is for {:?}, daemon runs {:?}", km.network(), self.network);
         }
         let store = WalletStore::open(&self.datadir.join(network_dir_name(self.network)).join(format!("{name}.sqlite")))?;
-        let mut lw = LoadedWallet { km, store, state: WalletState::default(), loaded: false, sync_progress: None, last_error: None, unlocked: None };
+        let mut lw = LoadedWallet { km, store, state: WalletState::default(), loaded: false, sync_progress: None, last_error: None, unlocked: None, own_outpoints: HashSet::new() };
         lw.rebuild_state()?;
         let w = Arc::new(Mutex::new(lw));
         self.wallets.write().await.insert(name.to_string(), w.clone());
@@ -264,79 +271,112 @@ impl Daemon {
 
     async fn sync_wallet_inner(self: &Arc<Self>, name: &str) -> anyhow::Result<()> {
         let Some(w) = self.get_wallet(name).await else { return Ok(()) };
-        let tip = { self.filters.lock().await.tip_height().unwrap_or(0) };
-        let (mut height, mut scripts, mut ours) = {
-            let mut lw = w.lock().await;
-            lw.km.ensure_gap();
-            (wallet::sync::scan_start(&lw.km, &lw.store), Arc::new(lw.km.scripts()), wallet::sync::own_outpoints(&lw.km, &lw.store)?)
-        };
         let mut total_new = 0u32;
+        let mut scanned_any = false;
         let mut last_log = std::time::Instant::now();
-        // The producer reads and matches filters ahead and fetches the matched blocks on every
-        // slot; this loop processes batches in order under the wallet lock. When a batch derives
-        // new keys, the lookahead was matched without them: the producer restarts from there.
-        'scan: while height <= tip {
-            let (tx, mut rx) = tokio::sync::mpsc::channel(SCAN_LOOKAHEAD);
-            let producer = tokio::spawn(Self::scan_ahead(self.clone(), height, tip, scripts.clone(), tx));
-            let mut outcome: anyhow::Result<()> = Ok(());
-            while let Some(r) = rx.recv().await {
-                let (rows, blocks) = match r {
-                    Ok(v) => v,
-                    Err(e) => {
-                        w.lock().await.last_error = Some(e.to_string());
-                        outcome = Err(e);
+        let outcome: anyhow::Result<()> = async {
+            // The producer reads and matches filters ahead and fetches the matched blocks; this
+            // loop processes batches in order under the wallet lock. It starts over (from the
+            // store's synced height, with the current scripts) whenever the matched-ahead work
+            // is stale: keys were derived (by this scan or by anyone else), or a reorg rolled the
+            // store back. A producer that dies is an error, never a finished scan.
+            loop {
+                let (height, tip, scripts, epoch) = {
+                    let mut lw = w.lock().await;
+                    lw.km.ensure_gap();
+                    let tip = { self.filters.lock().await.tip_height().unwrap_or(0) };
+                    (wallet::sync::scan_start(&lw.km, &lw.store), tip, Arc::new(lw.km.scripts()), self.chain_epoch.load(std::sync::atomic::Ordering::SeqCst))
+                };
+                if height > tip {
+                    return Ok(());
+                }
+                let key_count = scripts.len();
+                let (tx, mut rx) = tokio::sync::mpsc::channel(SCAN_LOOKAHEAD);
+                let producer = tokio::spawn(Self::scan_ahead(self.clone(), height, tip, scripts, tx));
+                let mut restart = false;
+                while let Some(r) = rx.recv().await {
+                    let (rows, blocks) = r?;
+                    let mut lw = w.lock().await;
+                    if self.chain_epoch.load(std::sync::atomic::Ordering::SeqCst) != epoch {
+                        restart = true; // a reorg rolled the store back under this batch
                         break;
                     }
-                };
-                let (next, report) = {
-                    let mut lw = w.lock().await;
-                    let LoadedWallet { km, store, .. } = &mut *lw;
-                    let r = wallet::sync::process_batch(km, store, &rows, &blocks, &mut ours)?;
-                    lw.sync_progress = Some((r.1.to, tip));
-                    if r.1.new_txs > 0 {
+                    let LoadedWallet { km, store, own_outpoints, .. } = &mut *lw;
+                    let (_, report) = wallet::sync::process_batch(km, store, &rows, &blocks, own_outpoints)?;
+                    scanned_any = true;
+                    lw.sync_progress = Some((report.to, tip));
+                    if report.new_txs > 0 {
                         lw.rebuild_state()?;
-                        tracing::info!("{name}: {} new transactions in {} blocks ({}..{})", r.1.new_txs, r.1.matched_blocks, r.1.from, r.1.to);
+                        tracing::info!("{name}: {} new transactions in {} blocks ({}..{})", report.new_txs, report.matched_blocks, report.from, report.to);
                     }
-                    if r.1.keys_changed {
-                        scripts = Arc::new(lw.km.scripts());
+                    total_new += report.new_txs;
+                    if last_log.elapsed().as_secs() >= 10 {
+                        tracing::info!("{name}: scanned to {} / {tip}", report.to);
+                        last_log = std::time::Instant::now();
                     }
-                    r
-                };
-                total_new += report.new_txs;
-                height = next;
-                if last_log.elapsed().as_secs() >= 10 {
-                    tracing::info!("{name}: scanned to {} / {tip}", height - 1);
-                    last_log = std::time::Instant::now();
+                    if report.keys_changed_at.is_some() || lw.km.scripts().len() != key_count {
+                        restart = true; // new keys: everything matched ahead has to be matched again
+                        break;
+                    }
                 }
-                if report.keys_changed {
-                    producer.abort();
-                    continue 'scan;
+                producer.abort();
+                match producer.await {
+                    Ok(()) => {}
+                    Err(e) if e.is_cancelled() => {}
+                    Err(e) => anyhow::bail!("scan task failed: {e}"),
+                }
+                if !restart {
+                    // The producer ended on its own: it must have delivered everything to the tip.
+                    let synced = w.lock().await.store.synced_height().unwrap_or(0);
+                    if synced < tip {
+                        anyhow::bail!("scan stopped at {synced} before the tip {tip}");
+                    }
+                    return Ok(());
                 }
             }
-            producer.abort();
-            outcome?;
-            break;
         }
+        .await;
         let mut lw = w.lock().await;
-        if !lw.loaded || total_new > 0 {
-            lw.rebuild_state()?;
+        match outcome {
+            Ok(()) => {
+                if !lw.loaded || total_new > 0 {
+                    lw.rebuild_state()?;
+                }
+                let tip = { self.filters.lock().await.tip_height().unwrap_or(0) };
+                if tip > 0 {
+                    lw.km.set_file_height(tip);
+                }
+                lw.loaded = true;
+                lw.sync_progress = None;
+                lw.last_error = None;
+                drop(lw);
+                if scanned_any {
+                    tokio::task::spawn_blocking(crate::mem::trim).await.ok();
+                }
+                Ok(())
+            }
+            Err(e) => {
+                lw.last_error = Some(e.to_string());
+                lw.sync_progress = None;
+                Err(e)
+            }
         }
-        if tip > 0 {
-            lw.km.set_file_height(tip);
-        }
-        lw.loaded = true;
-        lw.sync_progress = None;
-        lw.last_error = None;
-        drop(lw);
-        crate::mem::trim();
-        Ok(())
     }
 
-    /// Reads filters in batches from `height`, matches them on all cores and fetches the matched
-    /// blocks on all slots, delivering batches in order through `tx` until `tip` or an error.
+    /// Reads filters in batches from `height`, matches them and fetches the matched blocks,
+    /// delivering batches in order through `tx` until `tip` or an error. Fetch tasks die with it.
     async fn scan_ahead(me: Arc<Self>, mut height: u32, tip: u32, scripts: Arc<Vec<bitcoin::ScriptBuf>>, tx: tokio::sync::mpsc::Sender<anyhow::Result<(Arc<Vec<FilterRow>>, Vec<(usize, bitcoin::Block)>)>>) {
-        let limit = Arc::new(tokio::sync::Semaphore::new(wallet::sync::FETCH_SLOTS));
-        let mut inflight: std::collections::VecDeque<tokio::task::JoinHandle<anyhow::Result<(Arc<Vec<FilterRow>>, Vec<(usize, bitcoin::Block)>)>>> = Default::default();
+        type Batch = anyhow::Result<(Arc<Vec<FilterRow>>, Vec<(usize, bitcoin::Block)>)>;
+        /// In-order fetch tasks, aborted when the producer is dropped (abort included).
+        struct Inflight(std::collections::VecDeque<tokio::task::JoinHandle<Batch>>);
+        impl Drop for Inflight {
+            fn drop(&mut self) {
+                for h in &self.0 {
+                    h.abort();
+                }
+            }
+        }
+        let mut inflight = Inflight(Default::default());
         loop {
             if height <= tip {
                 let rows = match { me.filters.lock().await.range(height, 2000) } {
@@ -349,21 +389,16 @@ impl Daemon {
                 if !rows.is_empty() {
                     height = rows.last().map(|r| r.height + 1).unwrap_or(tip + 1);
                     let rows = Arc::new(rows);
-                    let (scripts, rows_m) = (scripts.clone(), rows.clone());
-                    let matched = match tokio::task::spawn_blocking(move || wallet::sync::match_filters(&scripts, &rows_m)).await {
-                        Ok(Ok(m)) => m,
-                        Ok(Err(e)) => {
+                    let matched = match wallet::sync::match_filters_async(scripts.clone(), rows.clone()).await {
+                        Ok(m) => m,
+                        Err(e) => {
                             let _ = tx.send(Err(e)).await;
                             return;
                         }
-                        Err(e) => {
-                            let _ = tx.send(Err(e.into())).await;
-                            return;
-                        }
                     };
-                    let (me2, limit2) = (me.clone(), limit.clone());
-                    inflight.push_back(tokio::spawn(async move {
-                        let blocks = wallet::sync::fetch_blocks(&me2.blocks, &rows, &matched, limit2).await?;
+                    let me2 = me.clone();
+                    inflight.0.push_back(tokio::spawn(async move {
+                        let blocks = wallet::sync::fetch_blocks(&me2.blocks, &rows, &matched).await?;
                         Ok((rows, blocks))
                     }));
                 } else {
@@ -371,20 +406,17 @@ impl Daemon {
                 }
             }
             let done = height > tip;
-            if inflight.is_empty() && done {
+            if inflight.0.is_empty() && done {
                 return;
             }
-            if inflight.len() >= SCAN_LOOKAHEAD || done {
-                let Some(head) = inflight.pop_front() else { return };
-                let item = match head.await {
+            if inflight.0.len() >= SCAN_LOOKAHEAD || done {
+                let Some(head) = inflight.0.pop_front() else { return };
+                let item: Batch = match head.await {
                     Ok(r) => r,
                     Err(e) => Err(e.into()),
                 };
                 let failed = item.is_err();
                 if tx.send(item).await.is_err() || failed {
-                    for h in inflight {
-                        h.abort();
-                    }
                     return;
                 }
             }
@@ -418,9 +450,11 @@ impl Daemon {
                         anyhow::bail!("reorg at {} reaches into Wasabi's read-only filter store; let Wasabi repair it", t.height);
                     }
                     for w in self.wallets.read().await.values() {
-                        let lw = w.lock().await;
+                        let mut lw = w.lock().await;
                         lw.store.rollback_above(t.height - 1)?;
+                        lw.rebuild_state()?;
                     }
+                    self.chain_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     continue;
                 }
             }
@@ -576,9 +610,11 @@ impl Daemon {
     pub async fn run_sync_loop(self: Arc<Self>) {
         let mut iteration: u32 = 0;
         loop {
-            if let Some(w) = crate::wasabi_guard::wasabi_running() {
-                self.wasabi_appeared(w).await;
-                return;
+            if self.network == Network::Bitcoin {
+                if let Some(w) = crate::wasabi_guard::wasabi_running() {
+                    self.wasabi_appeared(w).await;
+                    return;
+                }
             }
             match self.update_filters().await {
                 Ok(n) if n > 0 => tracing::info!("{n} new filters"),

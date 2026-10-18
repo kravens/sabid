@@ -168,7 +168,6 @@ impl WalletState {
     /// `Used` on the key manager (caller persists when it changed).
     pub fn build(txs: &[StoredTx], km: &mut KeyManager) -> (WalletState, bool) {
         let mut keys_changed = false;
-        let mut by_script: HashMap<ScriptBuf, usize> = km.keys.iter().enumerate().map(|(i, k)| (k.script.clone(), i)).collect();
         let excluded: HashSet<OutPoint> = km.excluded_coins().into_iter().collect();
         let mut coins: BTreeMap<OutPoint, Coin> = BTreeMap::new();
         let mut history = Vec::new();
@@ -196,7 +195,7 @@ impl WalletState {
                 *value_counts.entry(o.value.to_sat()).or_default() += 1;
             }
             for (vout, out) in st.tx.output.iter().enumerate() {
-                let Some(&ki) = by_script.get(&out.script_pubkey) else { continue };
+                let Some(ki) = km.position_of(&out.script_pubkey) else { continue };
                 let key = &mut km.keys[ki];
                 if key.state != KeyState::Used {
                     key.state = KeyState::Used;
@@ -229,12 +228,12 @@ impl WalletState {
                 .output
                 .iter()
                 .enumerate()
-                .filter(|(_, o)| by_script.contains_key(&o.script_pubkey))
+                .filter(|(_, o)| km.position_of(&o.script_pubkey).is_some())
                 .map(|(vout, o)| crate::analyzer::CoinRef { outpoint: OutPoint { txid, vout: vout as u32 }, script: o.script_pubkey.clone(), amount: o.value.to_sat() as i64 })
                 .collect();
             analyzer.analyze(&st.tx, spent_refs, out_refs);
-            if keys_changed && km.ensure_gap() {
-                by_script = km.keys.iter().enumerate().map(|(i, k)| (k.script.clone(), i)).collect();
+            if keys_changed {
+                km.ensure_gap(); // the key index grows with the keys
             }
             history.push(TxSummary {
                 txid,
