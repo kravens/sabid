@@ -20,5 +20,8 @@ bitcoin = { workspace = true }
 tracing = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
 base64 = "0.22"
+bip38 = "1"
+bip39 = { version = "2", features = ["rand"] }
+zeroize = "1"
 tokio-socks = "0.5"
 rand = { workspace = true }

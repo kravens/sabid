@@ -6,6 +6,7 @@ pub mod analyzer;
 pub mod bitcoind;
 pub mod filters;
 pub mod import;
+pub mod create;
 pub mod keymanager;
 pub mod p2p;
 pub mod store;

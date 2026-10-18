@@ -132,6 +132,18 @@ impl Daemon {
         }))
     }
 
+    /// A new wallet file in sabid's wallet directory; the name must be free there and in Wasabi's.
+    pub fn create_wallet(&self, name: &str, mnemonic: &bip39::Mnemonic, password: &str, birth_height: u32) -> anyhow::Result<()> {
+        if name.is_empty() || name.contains(['/', '\\']) || name == ".." || name.ends_with(".json") {
+            anyhow::bail!("Invalid wallet name.");
+        }
+        if self.wallet_files().iter().any(|n| n == name) {
+            anyhow::bail!("Wallet '{name}' already exists.");
+        }
+        wallet::create::write_wallet(&self.wallet_dir.join(format!("{name}.json")), mnemonic, password, self.network, birth_height)?;
+        Ok(())
+    }
+
     pub fn wallet_files(&self) -> Vec<String> {
         let list = |dir: &PathBuf| -> Vec<String> {
             std::fs::read_dir(dir)

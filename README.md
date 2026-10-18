@@ -19,10 +19,10 @@ design notes and the progress log.
   account over the bridge API), Coldcard Mk4 on the `coinjoin-fw-2` firmware (hidraw, HSM policy).
 - Wasabi-compatible JSON-RPC, a CLI, an MCP server.
 
-Not yet: sending outside coinjoin (`send`, `build`, `broadcast`, `payincoinjoin`), wallet
-creation/recovery/import over RPC, mempool scanning for foreign transactions, Passport and Krux,
-pure-Rust WabiSabi crypto (the vendored C library is used through FFI). `startcoinjoinsweep`
-(coinjoin into another wallet) exists but has not run live yet.
+Not yet: sending outside coinjoin (`send`, `build`, `broadcast`, `payincoinjoin`), hardware
+wallet import and `enablecoinjoin` over RPC, mempool scanning for foreign transactions, Passport
+and Krux, pure-Rust WabiSabi crypto (the vendored C library is used through FFI).
+`startcoinjoinsweep` (coinjoin into another wallet) exists but has not run live yet.
 
 ## Build
 
@@ -74,6 +74,8 @@ sabid devices                              # Trezor bridge devices, a Coldcard o
 sabid import-wasabi-txs --wallet MyWallet  # seed the tx store from Wasabi's ConfirmedTransactions, no rescan
 sabid export-wallet --wallet MyWallet      # copy sabid's wallet file (labels, key states) back over Wasabi's, with a backup
 sabid rpc getwalletinfo --wallet MyWallet  # any RPC method, params as a JSON array or object
+sabid create-wallet --name MyWallet        # prompts for the password, prints the 12 words once
+sabid recover-wallet --name MyWallet [--birth-height N]   # prompts for words and password
 sabid unlock --wallet MyWallet [--ttl 3600]  # soft wallet: type the password here, the daemon keeps the key for --ttl seconds
 sabid lock --wallet MyWallet
 sabid rpc startcoinjoin --wallet MyWallet  # no password once unlocked (or pass '["password", true, true]')
@@ -94,6 +96,8 @@ curl -s -u user:pass http://127.0.0.1:37128/MyWallet \
 |---|---|---|
 | `getstatus` | | Tor, best height, filters left, network |
 | `listwallets` | | wallet files the daemon can see |
+| `createwallet` | `[walletName, password]` | new 12-word soft wallet, birth height = current tip; returns the words (never over MCP) |
+| `recoverwallet` | `[walletName, mnemonic, password, birthHeight?]` | Wasabi-format file from the words; scans from `birthHeight` (default: first segwit block) |
 | `loadwallet`, `selectwallet` | `[name]` | loads and starts syncing |
 | `getwalletinfo` | | balance, accounts, `coinjoinStatus`, `syncProgress`, `lastError`, device settings |
 | `listunspentcoins`, `listcoins` | | amount, anonymity score, label, confirmations (`listcoins` includes spent) |
@@ -125,9 +129,9 @@ launch `wassabeed` itself, while sabid you start by hand. Flow:
 
 sabi's coinjoin dashboard, coin list, history, receive, start/stop and device limits use methods
 sabid has. Screens that call `payincoinjoin`, `listpaymentsincoinjoin`, `startcoinjoinsweep`,
-`recoverwallet`, `importhardwarewallet` or `enablecoinjoin` get a "method not found" error from
-sabid until those land (see `PLAN.md`); `startcoinjoinsweep` works; `wcli.sh` style one-liners
-work as is.
+`importhardwarewallet` or `enablecoinjoin` get a "method not found" error from sabid until those
+land (see `PLAN.md`); `startcoinjoinsweep`, `createwallet` and `recoverwallet` work; `wcli.sh`
+style one-liners work as is.
 
 ## MCP
 

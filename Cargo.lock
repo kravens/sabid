@@ -213,6 +213,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "bip39"
+version = "2.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "90dbd31c98227229239363921e60fcf5e558e43ec69094d46fc4996f08d1d5bc"
+dependencies = [
+ "bitcoin_hashes",
+ "rand 0.8.8",
+ "rand_core 0.6.4",
+ "serde",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "bitcoin"
 version = "0.32.102"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1560,6 +1573,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64 0.22.1",
+ "bip39",
  "bitcoin",
  "chrono",
  "clap",
@@ -2164,6 +2178,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "bip38",
+ "bip39",
  "bitcoin",
  "chrono",
  "futures-util",
@@ -2178,6 +2194,7 @@ dependencies = [
  "tokio-socks",
  "tracing",
  "wasabi-proto",
+ "zeroize",
 ]
 
 [[package]]

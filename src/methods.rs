@@ -28,6 +28,24 @@ pub async fn call(ctx: &Ctx, method: &str, p: Params) -> Result<Value, RpcError>
             }))
         }
         "listwallets" => Ok(Value::Array(d.wallet_files().into_iter().map(|n| json!({"walletName": n})).collect())),
+        "createwallet" => {
+            let name = p.str(0, "walletName")?;
+            let password = p.str_opt(1, "password").unwrap_or_default();
+            let mnemonic = bip39::Mnemonic::generate(12).map_err(|e| RpcError::internal(e.to_string()))?;
+            // Fresh wallet: nothing to find before today's tip.
+            let birth = d.filters.lock().await.tip_height().unwrap_or(wallet::filters::SEGWIT_ACTIVATION_HEIGHT);
+            d.create_wallet(&name, &mnemonic, &password, birth).map_err(RpcError::internal)?;
+            Ok(Value::String(mnemonic.to_string()))
+        }
+        "recoverwallet" => {
+            let name = p.str(0, "walletName")?;
+            let words = p.str(1, "mnemonic")?;
+            let password = p.str_opt(2, "password").unwrap_or_default();
+            let mnemonic = bip39::Mnemonic::parse(words.trim()).map_err(|_| RpcError::internal("Invalid value for mnemonic"))?;
+            let birth = p.u64_or(3, "birthHeight", wallet::filters::SEGWIT_ACTIVATION_HEIGHT as u64) as u32;
+            d.create_wallet(&name, &mnemonic, &password, birth).map_err(RpcError::internal)?;
+            Ok(Value::Null)
+        }
         "loadwallet" | "selectwallet" => {
             let name = p.str(0, "walletName")?;
             d.load_wallet(&name).await?;

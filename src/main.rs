@@ -87,6 +87,23 @@ enum Cmd {
         #[arg(long)]
         url: Option<String>,
     },
+    /// Create a soft wallet on the daemon: asks for the password here, prints the 12 words once
+    CreateWallet {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// Recover a soft wallet on the daemon from its words: asks for words and password here
+    RecoverWallet {
+        #[arg(long)]
+        name: String,
+        /// Block height to scan from (default: the first segwit block, a full scan)
+        #[arg(long)]
+        birth_height: Option<u32>,
+        #[arg(long)]
+        url: Option<String>,
+    },
     /// Forget a wallet's decrypted key in the daemon
     Lock {
         #[arg(long)]
@@ -282,6 +299,31 @@ async fn main() -> anyhow::Result<()> {
             password.zeroize();
             r?;
             println!("{wallet} unlocked for {ttl} s; startcoinjoin needs no password until then.");
+        }
+        Cmd::CreateWallet { name, url } => {
+            use zeroize::Zeroize;
+            let mut password = read_password("Password for the new wallet (empty for none): ")?;
+            let mut again = read_password("Repeat the password: ")?;
+            if password != again {
+                password.zeroize();
+                again.zeroize();
+                anyhow::bail!("the passwords differ");
+            }
+            again.zeroize();
+            let r = rpc_result(&cfg, url, None, "createwallet", serde_json::json!([name, password])).await;
+            password.zeroize();
+            let words = r?;
+            println!("Wallet {name} created. Write these 12 words down now; they are shown only once and are the only backup:\n\n  {}\n", words.as_str().unwrap_or(""));
+        }
+        Cmd::RecoverWallet { name, birth_height, url } => {
+            use zeroize::Zeroize;
+            let mut words = read_password("Recovery words (hidden): ")?;
+            let mut password = read_password("Wallet password (empty for none): ")?;
+            let r = rpc_result(&cfg, url, None, "recoverwallet", serde_json::json!([name, words, password, birth_height.unwrap_or(wallet::filters::SEGWIT_ACTIVATION_HEIGHT)])).await;
+            words.zeroize();
+            password.zeroize();
+            r?;
+            println!("Wallet {name} recovered; load it with `sabid rpc loadwallet '[\"{name}\"]'` and let it scan.");
         }
         Cmd::Lock { wallet, url } => {
             rpc_result(&cfg, url, Some(&wallet), "lockwallet", serde_json::json!([])).await?;
