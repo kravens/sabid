@@ -33,7 +33,7 @@ pub async fn call(ctx: &Ctx, method: &str, p: Params) -> Result<Value, RpcError>
             let password = p.str_opt(1, "password").unwrap_or_default();
             let mnemonic = bip39::Mnemonic::generate(12).map_err(|e| RpcError::internal(e.to_string()))?;
             // Fresh wallet: nothing to find before today's tip.
-            let birth = d.filters.lock().await.tip_height().unwrap_or(wallet::filters::SEGWIT_ACTIVATION_HEIGHT);
+            let birth = d.filters.lock().await.tip_height().unwrap_or(wallet::filters::first_height(d.network));
             d.create_wallet(&name, &mnemonic, &password, birth).map_err(RpcError::internal)?;
             Ok(Value::String(mnemonic.to_string()))
         }
@@ -42,7 +42,7 @@ pub async fn call(ctx: &Ctx, method: &str, p: Params) -> Result<Value, RpcError>
             let words = p.str(1, "mnemonic")?;
             let password = p.str_opt(2, "password").unwrap_or_default();
             let mnemonic = bip39::Mnemonic::parse(words.trim()).map_err(|_| RpcError::internal("Invalid value for mnemonic"))?;
-            let birth = p.u64_or(3, "birthHeight", wallet::filters::SEGWIT_ACTIVATION_HEIGHT as u64) as u32;
+            let birth = p.u64_or(3, "birthHeight", wallet::filters::first_height(d.network) as u64) as u32;
             d.create_wallet(&name, &mnemonic, &password, birth).map_err(RpcError::internal)?;
             Ok(Value::Null)
         }
@@ -408,7 +408,7 @@ pub async fn call(ctx: &Ctx, method: &str, p: Params) -> Result<Value, RpcError>
         "importhardwarewallet" => {
             let name = p.str(0, "walletName")?;
             let enable_coinjoin = p.bool_or(1, "enableCoinjoin", false);
-            let birth = p.u64_or(2, "birthHeight", wallet::filters::SEGWIT_ACTIVATION_HEIGHT as u64) as u32;
+            let birth = p.u64_or(2, "birthHeight", wallet::filters::first_height(d.network) as u64) as u32;
             let path = d.new_wallet_path(&name).map_err(RpcError::internal)?;
             let (dev, fp) = crate::devices::find(None).await.map_err(RpcError::internal)?;
             let segwit = crate::devices::account_xpub(&dev, &wallet::create::account_path(84, d.network), d.network).await.map_err(RpcError::internal)?;

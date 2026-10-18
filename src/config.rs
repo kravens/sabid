@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct WasabiConfig {
+    /// "Main", "TestNet", "TestNet4", "Signet" or "RegTest", as Wasabi writes it.
+    pub network: String,
     pub coordinator_uri: String,
     pub use_tor: String,
     pub json_rpc_server_enabled: bool,
@@ -25,6 +27,7 @@ pub struct WasabiConfig {
 impl Default for WasabiConfig {
     fn default() -> Self {
         Self {
+            network: "Main".into(),
             coordinator_uri: "https://coinjoin.nl".into(),
             use_tor: "Enabled".into(),
             json_rpc_server_enabled: false,
@@ -52,6 +55,15 @@ impl WasabiConfig {
         let text = String::from_utf8_lossy(&raw);
         let text = text.trim_start_matches('\u{feff}');
         Ok(serde_json::from_str(text)?)
+    }
+
+    pub fn network(&self) -> bitcoin::Network {
+        match self.network.as_str() {
+            "TestNet" | "TestNet4" => bitcoin::Network::Testnet,
+            "RegTest" => bitcoin::Network::Regtest,
+            "Signet" => bitcoin::Network::Signet,
+            _ => bitcoin::Network::Bitcoin,
+        }
     }
 
     pub fn load_default() -> anyhow::Result<Self> {

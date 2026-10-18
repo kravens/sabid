@@ -158,7 +158,8 @@ impl Daemon {
         lw.km = KeyManager::load(&lw.km.path)?;
         lw.km.ensure_gap();
         lw.km.save()?;
-        let birth = lw.km.birth_height().unwrap_or(wallet::filters::SEGWIT_ACTIVATION_HEIGHT).max(wallet::filters::SEGWIT_ACTIVATION_HEIGHT);
+        let first = wallet::filters::first_height(self.network);
+        let birth = lw.km.birth_height().unwrap_or(first).max(first);
         lw.store.rollback_above(birth.saturating_sub(1))?;
         match self.filters.lock().await.get(birth.saturating_sub(1)) {
             Some(row) => lw.store.set_synced(row.height, &row.block_hash)?,
@@ -320,7 +321,7 @@ impl Daemon {
             let tip = { self.filters.lock().await.tip() };
             let (mut next, prev_hash) = match &tip {
                 Some(t) => (t.height + 1, Some(t.block_hash)),
-                None => (wallet::filters::SEGWIT_ACTIVATION_HEIGHT, None),
+                None => (wallet::filters::first_height(self.network), None),
             };
             if let (Some(t), Some(ph)) = (&tip, prev_hash) {
                 // Reorg check: our tip must still be the node's block at that height.
@@ -439,32 +440,38 @@ impl Daemon {
         let wallets: Vec<_> = self.wallets.read().await.values().cloned().collect();
         for w in wallets {
             let mut lw = w.lock().await;
-            let scripts: HashSet<bitcoin::ScriptBuf> = lw.km.scripts().into_iter().collect();
-            let ours = lw.state.coins.iter().any(|c| spent.contains(&c.outpoint)) || tx.output.iter().any(|o| scripts.contains(&o.script_pubkey));
-            if !ours {
-                continue;
-            }
+            // A replaced transaction may have paid a wallet the replacement does not touch (a cancel):
+            // every wallet forgets what conflicts with the new inputs.
+            let mut changed = false;
             for (old, _) in lw.store.mempool_txs().unwrap_or_default() {
                 if old != tx.compute_txid() {
                     if let Some(t) = lw.store.get_tx(&old) {
                         if t.input.iter().any(|i| spent.contains(&i.previous_output)) {
                             tracing::info!("{}: {old} replaced by {}", lw.km.wallet_name(), tx.compute_txid());
                             lw.store.delete_tx(&old).ok();
+                            changed = true;
                         }
                     }
                 }
             }
-            if let Err(e) = lw.store.insert_tx(tx, wallet::store::MEMPOOL_HEIGHT, &bitcoin::BlockHash::all_zeros(), 0, now) {
-                tracing::warn!("storing broadcast: {e}");
-            }
-            for o in &tx.output {
-                if let Some(k) = lw.km.key_for_script_mut(&o.script_pubkey) {
-                    k.state = wallet::KeyState::Used;
+            let scripts: HashSet<bitcoin::ScriptBuf> = lw.km.scripts().into_iter().collect();
+            let ours = lw.state.coins.iter().any(|c| spent.contains(&c.outpoint)) || tx.output.iter().any(|o| scripts.contains(&o.script_pubkey));
+            if ours {
+                if let Err(e) = lw.store.insert_tx(tx, wallet::store::MEMPOOL_HEIGHT, &bitcoin::BlockHash::all_zeros(), 0, now) {
+                    tracing::warn!("storing broadcast: {e}");
                 }
+                for o in &tx.output {
+                    if let Some(k) = lw.km.key_for_script_mut(&o.script_pubkey) {
+                        k.state = wallet::KeyState::Used;
+                    }
+                }
+                lw.km.save().ok();
+                changed = true;
             }
-            lw.km.save().ok();
-            if let Err(e) = lw.rebuild_state() {
-                tracing::warn!("rebuild after broadcast: {e}");
+            if changed {
+                if let Err(e) = lw.rebuild_state() {
+                    tracing::warn!("rebuild after broadcast: {e}");
+                }
             }
         }
     }

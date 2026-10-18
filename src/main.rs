@@ -26,6 +26,12 @@ struct Cli {
     /// sabid data directory (stores, logs, own tor)
     #[arg(long, global = true, default_value_os_t = default_datadir())]
     datadir: PathBuf,
+    /// Wasabi-format Config.json to read (default: ~/.walletwasabi/client/Config.json)
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+    /// main, testnet, signet or regtest (default: the config's Network)
+    #[arg(long, global = true)]
+    network: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -132,7 +138,19 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,hyper=warn,reqwest=warn".into()))
         .init();
     let cli = Cli::parse();
-    let mut cfg = config::WasabiConfig::load_default()?;
+    let mut cfg = match &cli.config {
+        Some(p) => config::WasabiConfig::load(p)?,
+        None => config::WasabiConfig::load_default()?,
+    };
+    let network = match cli.network.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        None => cfg.network(),
+        Some("main" | "mainnet" | "bitcoin") => bitcoin::Network::Bitcoin,
+        Some("testnet" | "testnet4") => bitcoin::Network::Testnet,
+        Some("signet") => bitcoin::Network::Signet,
+        Some("regtest") => bitcoin::Network::Regtest,
+        Some(other) => anyhow::bail!("unknown network '{other}'"),
+    };
+    let net_dir = daemon::network_dir_name(network);
     if let Some(c) = &cli.coordinator {
         cfg.coordinator_uri = c.clone();
     }
@@ -187,7 +205,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(tor::ensure_tor(cli.socks.as_deref(), tor_binary.as_deref(), &cli.datadir).await?)
             };
             let socks = tor_handle.as_ref().map(|t| t.socks.clone());
-            let d = daemon::Daemon::new(cfg.clone(), bitcoin::Network::Bitcoin, cli.datadir.clone(), socks, wallet_dir)?;
+            let d = daemon::Daemon::new(cfg.clone(), network, cli.datadir.clone(), socks, wallet_dir)?;
             for w in &wallets {
                 match d.load_wallet(w).await {
                     Ok(_) => tracing::info!("wallet {w} loaded"),
@@ -220,7 +238,7 @@ async fn main() -> anyhow::Result<()> {
             if let Some(s) = wasabi_guard::sabid_daemon_running() {
                 anyhow::bail!("a sabid daemon is running: {s}. Stop it first so the exported file is complete.");
             }
-            let own = cli.datadir.join("Main/Wallets").join(format!("{wallet}.json"));
+            let own = cli.datadir.join(net_dir).join("Wallets").join(format!("{wallet}.json"));
             if !own.exists() {
                 anyhow::bail!("sabid has no copy of '{wallet}' ({})", own.display());
             }
@@ -236,18 +254,18 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::ImportWasabiTxs { wallet, wallet_dir } => {
             // sabid's own copy when it has one, else the file Wasabi keeps.
-            let own = cli.datadir.join("Main/Wallets").join(format!("{wallet}.json"));
+            let own = cli.datadir.join(net_dir).join("Wallets").join(format!("{wallet}.json"));
             let path = match wallet_dir {
                 Some(d) => d.join(format!("{wallet}.json")),
                 None if own.exists() => own,
                 None => config::wasabi_data_dir().join("Wallets").join(format!("{wallet}.json")),
             };
             let km = wallet::KeyManager::load(&path)?;
-            let net_dir = cli.datadir.join("Main");
-            let store = wallet::WalletStore::open(&net_dir.join(format!("{wallet}.sqlite")))?;
-            let tx_store = config::wasabi_data_dir().join("BitcoinStore/Main/ConfirmedTransactions/2/Transactions.sqlite");
+            let own_net_dir = cli.datadir.join(net_dir);
+            let store = wallet::WalletStore::open(&own_net_dir.join(format!("{wallet}.sqlite")))?;
+            let tx_store = config::wasabi_data_dir().join("BitcoinStore").join(net_dir).join("ConfirmedTransactions/2/Transactions.sqlite");
             let (n, max_h) = wallet::import::from_wasabi_store(&tx_store, &km, &store)?;
-            let filters = wallet::filters::FilterStore::open(Some(&config::wasabi_data_dir().join("BitcoinStore/Main/IndexStore/IndexStore.sqlite")), &net_dir.join("filters.sqlite"))?;
+            let filters = wallet::filters::FilterStore::open(Some(&config::wasabi_data_dir().join("BitcoinStore").join(net_dir).join("IndexStore/IndexStore.sqlite")), &own_net_dir.join("filters.sqlite"))?;
             let synced = km.file_height().unwrap_or(max_h).max(max_h);
             match filters.get(synced) {
                 Some(row) => {
@@ -321,7 +339,7 @@ async fn main() -> anyhow::Result<()> {
             use zeroize::Zeroize;
             let mut words = read_password("Recovery words (hidden): ")?;
             let mut password = read_password("Wallet password (empty for none): ")?;
-            let r = rpc_result(&cfg, url, None, "recoverwallet", serde_json::json!([name, words, password, birth_height.unwrap_or(wallet::filters::SEGWIT_ACTIVATION_HEIGHT)])).await;
+            let r = rpc_result(&cfg, url, None, "recoverwallet", serde_json::json!([name, words, password, birth_height])).await;
             words.zeroize();
             password.zeroize();
             r?;

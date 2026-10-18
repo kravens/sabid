@@ -10,6 +10,15 @@ use std::sync::Mutex;
 
 pub const SEGWIT_ACTIVATION_HEIGHT: u32 = 481_824;
 
+/// The first block worth a filter: segwit activation on mainnet, the genesis block elsewhere.
+pub fn first_height(network: bitcoin::Network) -> u32 {
+    if network == bitcoin::Network::Bitcoin {
+        SEGWIT_ACTIVATION_HEIGHT
+    } else {
+        0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FilterRow {
     pub height: u32,

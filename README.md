@@ -20,9 +20,8 @@ design notes and the progress log.
 - Wasabi-compatible JSON-RPC, a CLI, an MCP server.
 
 Not yet: sending from a Trezor, payments inside coinjoins (`payincoinjoin`), Passport and Krux,
-pure-Rust WabiSabi crypto (the vendored C library is used through FFI). `startcoinjoinsweep`,
-`send`, the fee bumps and the device import/enable methods exist but have not run live end to end
-yet.
+pure-Rust WabiSabi crypto (the vendored C library is used through FFI). `send`, the fee bumps, mempool pickup and recovery passed the regtest smoke test;
+`startcoinjoinsweep` and the device import/enable methods have not run end to end yet.
 
 ## Build
 
@@ -32,7 +31,12 @@ vendored and built by `cc`; no cmake, no system libraries.
 ```sh
 cargo build --release          # target/release/sabid
 cargo test --workspace
+BITCOIND=/path/to/bitcoind BITCOIN_CLI=/path/to/bitcoin-cli scripts/regtest-smoke.sh
 ```
+
+The smoke test starts a throwaway regtest node under `/tmp/sabid-regtest`, creates two wallets,
+mines, syncs, sends, bumps and cancels with RBF, picks up a foreign payment from the mempool and
+recovers a wallet from its words. It touches nothing under `~/.walletwasabi` or `~/.sabid`.
 
 ## Run
 
@@ -48,6 +52,7 @@ written. `--wallet-dir` points both reading and writing at a directory of your c
 sabid daemon --wallet MyWallet                      # RPC on the Config.json prefix, 127.0.0.1:37128 by default
 sabid daemon --wallet A --wallet B --rpc-bind 127.0.0.1:37129 --wallet-dir ~/wallets --datadir ~/sabid-data
 sabid daemon --wallet MyWallet --coordinator https://coinjoin.nl   # override CoordinatorUri
+sabid --config ./Config.json --network regtest daemon --no-tor       # another config file, another network
 ```
 
 Tor: sabid uses a SOCKS proxy on `127.0.0.1:37150` (Wasabi's) or `:9050` when one answers, else it

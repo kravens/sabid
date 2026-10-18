@@ -3,7 +3,7 @@
 
 use futures_util::future::join_all;
 use crate::bitcoind::Bitcoind;
-use crate::filters::{FilterRow, SEGWIT_ACTIVATION_HEIGHT};
+use crate::filters::{first_height, FilterRow};
 use crate::keymanager::KeyManager;
 use crate::store::WalletStore;
 use bitcoin::bip158::BlockFilter;
@@ -69,7 +69,7 @@ pub struct ScanReport {
 pub fn scan_start(km: &KeyManager, store: &WalletStore) -> u32 {
     match store.synced_height() {
         Some(h) => h + 1,
-        None => km.birth_height().unwrap_or(SEGWIT_ACTIVATION_HEIGHT).max(SEGWIT_ACTIVATION_HEIGHT),
+        None => km.birth_height().unwrap_or(first_height(km.network())).max(first_height(km.network())),
     }
 }
 
