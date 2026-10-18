@@ -16,6 +16,8 @@ pub async fn call(ctx: &Ctx, method: &str, p: Params) -> Result<Value, RpcError>
             let left = node_height.map(|n| n.saturating_sub(tip_height)).unwrap_or(0);
             let tor_status = if !d.tor_enabled { "Turned off" } else if d.socks.is_some() { "Running" } else { "Not running" };
             Ok(json!({
+                "daemon": "sabid",
+                "version": env!("CARGO_PKG_VERSION"),
                 "torStatus": tor_status,
                 "onionService": "Unavailable",
                 "bestBlockchainHeight": tip_height.to_string(),

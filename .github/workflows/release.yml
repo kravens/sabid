@@ -1,0 +1,54 @@
+name: release
+# A tag v* builds the Linux x86_64 binary, packages it with the docs and the regtest smoke test,
+# writes SHA256SUMS, signs it with the release key when the SABID_SIGNING_KEY secret exists
+# (secp256k1 EC private key, PEM; see README "Releases"), and publishes a pre-release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x64:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build
+        run: cargo build --release --locked
+      - name: test
+        run: cargo test --release --workspace --locked
+      - name: package
+        run: |
+          set -eu
+          TAG="${GITHUB_REF_NAME:-dev}"
+          NAME="sabid-${TAG}-linux-x64"
+          mkdir -p "dist/$NAME/scripts"
+          cp target/release/sabid README.md LICENSE PLAN.md "dist/$NAME/"
+          cp scripts/regtest-smoke.sh "dist/$NAME/scripts/"
+          tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
+          (cd dist && sha256sum "$NAME.tar.gz" > SHA256SUMS)
+          cat dist/SHA256SUMS
+      - name: sign SHA256SUMS
+        if: ${{ env.SABID_SIGNING_KEY != '' }}
+        env:
+          SABID_SIGNING_KEY: ${{ secrets.SABID_SIGNING_KEY }}
+        run: |
+          set -eu
+          umask 077
+          printf '%s\n' "$SABID_SIGNING_KEY" > key.pem
+          openssl dgst -sha256 -sign key.pem dist/SHA256SUMS | base64 -w0 > dist/SHA256SUMS.sabidsig
+          openssl ec -in key.pem -pubout -conv_form compressed -outform DER 2>/dev/null | tail -c 33 | od -An -tx1 | tr -d ' \n' > dist/release-key.hex
+          rm -f key.pem
+          echo "signed with key $(cat dist/release-key.hex)"
+      - name: publish
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+            dist/SHA256SUMS.sabidsig
+            dist/release-key.hex

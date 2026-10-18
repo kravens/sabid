@@ -231,6 +231,23 @@ Ideas on the table, none implemented yet; each gets a design section in `PLAN.md
   send follows once ordinary sending exists.
 - Pure-Rust WabiSabi credentials (drop the C FFI), Passport and Krux signers, mempool scanning.
 
+## Releases
+
+A tag `v*` makes the `release` workflow build `sabid-<tag>-linux-x64.tar.gz`, write
+`SHA256SUMS`, sign it when the `SABID_SIGNING_KEY` repository secret holds the release key, and
+publish a pre-release. The signature is a secp256k1 ECDSA signature (DER, base64) over
+`SHA256(SHA256SUMS)`, the same scheme Wasabi uses for `SHA256SUMS.wasabisig`, so sabi.py can
+verify it with its pure-Python verifier against a pinned public key.
+
+```sh
+openssl ecparam -name secp256k1 -genkey -noout -out sabid-release-key.pem   # keep it offline too
+openssl ec -in sabid-release-key.pem -pubout -conv_form compressed -outform DER | tail -c 33 | od -An -tx1 | tr -d ' \n'
+```
+
+The second command prints the 33-byte public key to pin (`SABID_RELEASE_PUBKEY` in sabi.py); the
+PEM goes into the `SABID_SIGNING_KEY` secret. Until a signed release exists, sabi.py refuses to
+install sabid and says so.
+
 ## Layout
 
 | crate | what |
