@@ -52,6 +52,15 @@ enum Cmd {
         #[arg(long)]
         wallet_dir: Option<PathBuf>,
     },
+    /// Seed a wallet's transaction store from Wasabi's own confirmed-transaction store (no rescan)
+    ImportWasabiTxs {
+        #[arg(long)]
+        wallet: String,
+        #[arg(long)]
+        wallet_dir: Option<PathBuf>,
+    },
+    /// List hardware wallets: Trezor bridge devices and a Coldcard on USB (with its HSM state)
+    Devices,
     /// Model Context Protocol server on stdio for agents (thin client of a running daemon)
     Mcp {
         /// RPC URL of the daemon (default: from Config.json)
@@ -77,8 +86,11 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,hyper=warn,reqwest=warn".into()))
         .init();
     let cli = Cli::parse();
-    let cfg = config::WasabiConfig::load_default()?;
-    let coordinator = cli.coordinator.clone().unwrap_or(cfg.coordinator_uri.clone());
+    let mut cfg = config::WasabiConfig::load_default()?;
+    if let Some(c) = &cli.coordinator {
+        cfg.coordinator_uri = c.clone();
+    }
+    let coordinator = cfg.coordinator_uri.clone();
 
     match cli.cmd {
         Cmd::Status => {
@@ -142,6 +154,48 @@ async fn main() -> anyhow::Result<()> {
             }
             sync.abort();
             drop(tor_handle);
+        }
+        Cmd::ImportWasabiTxs { wallet, wallet_dir } => {
+            let wdir = wallet_dir.unwrap_or_else(|| config::wasabi_data_dir().join("Wallets"));
+            let km = wallet::KeyManager::load(&wdir.join(format!("{wallet}.json")))?;
+            let net_dir = cli.datadir.join("Main");
+            let store = wallet::WalletStore::open(&net_dir.join(format!("{wallet}.sqlite")))?;
+            let tx_store = config::wasabi_data_dir().join("BitcoinStore/Main/ConfirmedTransactions/2/Transactions.sqlite");
+            let (n, max_h) = wallet::import::from_wasabi_store(&tx_store, &km, &store)?;
+            let filters = wallet::filters::FilterStore::open(Some(&config::wasabi_data_dir().join("BitcoinStore/Main/IndexStore/IndexStore.sqlite")), &net_dir.join("filters.sqlite"))?;
+            let synced = km.file_height().unwrap_or(max_h).max(max_h);
+            match filters.get(synced) {
+                Some(row) => {
+                    store.set_synced(synced, &row.block_hash)?;
+                    println!("imported {n} transactions for {wallet}; synced height set to {synced}");
+                }
+                None => println!("imported {n} transactions for {wallet}; no filter for height {synced}, scan starts at the birth height"),
+            }
+        }
+        Cmd::Devices => {
+            match hw::TrezorDevice::enumerate().await {
+                Ok(list) => {
+                    for d in list {
+                        println!("trezor  path={} model={} fw={} fingerprint={} error={}", d.path, d.model, d.firmware, d.fingerprint, d.error.unwrap_or_default());
+                    }
+                }
+                Err(e) => println!("trezor bridge: {e}"),
+            }
+            match tokio::task::spawn_blocking(hw::ColdcardDevice::open).await? {
+                Ok(dev) => {
+                    println!("coldcard fingerprint={} xpub={}…", dev.master_fingerprint, &dev.master_xpub[..dev.master_xpub.len().min(12)]);
+                    let dev = std::sync::Arc::new(dev);
+                    let d2 = dev.clone();
+                    let version = tokio::task::spawn_blocking(move || d2.version()).await?;
+                    println!("coldcard version: {}", version.map(|v| v.replace('\n', " | ")).unwrap_or_else(|e| e.to_string()));
+                    let d3 = dev.clone();
+                    match tokio::task::spawn_blocking(move || d3.hsm_status()).await? {
+                        Ok(s) => println!("coldcard hsm: active={} approval_wait={} policy_hash={} summary={}", s.active, s.approval_wait, s.policy_hash.unwrap_or_default(), s.summary.map(|x| x.replace('\n', " | ")).unwrap_or_default()),
+                        Err(e) => println!("coldcard hsm: {e}"),
+                    }
+                }
+                Err(e) => println!("coldcard: {e}"),
+            }
         }
         Cmd::Mcp { url } => {
             let base = url.unwrap_or_else(|| cfg.json_rpc_server_prefixes.first().cloned().unwrap_or_else(|| "http://127.0.0.1:37128/".into()));

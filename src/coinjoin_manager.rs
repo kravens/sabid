@@ -163,6 +163,7 @@ pub struct CoinJoinManager {
     pub prison: Arc<CoinPrison>,
     pub liquidity_clue: Arc<Mutex<Option<i64>>>,
     pub trezor: Mutex<Option<Arc<hw::TrezorKeyChain>>>,
+    pub coldcard: Mutex<Option<Arc<hw::ColdcardKeyChain>>>,
 }
 
 pub const PLEB_STOP_DEFAULT_SATS: i64 = 1_000_000;
@@ -216,6 +217,7 @@ impl CoinJoinManager {
             prison,
             liquidity_clue: Arc::new(Mutex::new(None)),
             trezor: Mutex::new(None),
+            coldcard: Mutex::new(None),
         });
         tokio::spawn(updater.run(m.updater_stop.clone()));
         Ok(m)
@@ -293,8 +295,11 @@ impl CoinJoinManager {
                 w.km.has_slip25_account(),
             )
         };
+        if vendor == 2 {
+            return self.coldcard_key_chain().await;
+        }
         if vendor != 1 {
-            return Err(format!("DeviceAuthorizationFailed: only Trezor is implemented for device-signed coinjoins (CoinJoinVendor={vendor})."));
+            return Err(format!("DeviceAuthorizationFailed: only Trezor and Coldcard are implemented for device-signed coinjoins (CoinJoinVendor={vendor})."));
         }
         if !has_slip25 {
             return Err("DeviceAuthorizationFailed: this wallet has no SLIP-25 coinjoin account; import it with coinjoin enabled in Wasabi first.".into());
@@ -318,6 +323,79 @@ impl CoinJoinManager {
                 .map_err(|e| format!("DeviceAuthorizationFailed: {e}"))?;
         }
         *self.trezor.lock().await = Some(kc.clone());
+        Ok(kc)
+    }
+
+    /// Coldcard (Preview 8 shape): the device runs an HSM policy composed from the wallet's limits; the
+    /// user approves it on the device once per boot, then proofs and signatures come unattended.
+    async fn coldcard_key_chain(self: &Arc<Self>) -> Result<Arc<dyn KeyChain>, String> {
+        if let Some(kc) = self.coldcard.lock().await.clone() {
+            if !kc.needs_authorization() {
+                return Ok(kc);
+            }
+        }
+        let (fingerprint, keys, policy, approved_hash, max_rounds, max_fee, min_inputs) = {
+            let w = self.wallet.lock().await;
+            let keys: HashMap<ScriptBuf, hw::ColdcardKeyInfo> = w.km.keys.iter().filter(|k| k.kind != AccountKind::Other).map(|k| (k.script.clone(), hw::ColdcardKeyInfo { path: k.path.clone(), pubkey: k.pubkey.inner })).collect();
+            let mut accounts = vec![w.km.segwit_account_path().to_string()];
+            if let (Some(_), Some(p)) = (w.km.taproot_xpub(), w.km.taproot_account_path()) {
+                accounts.push(p.to_string());
+            }
+            let max_fee = w.km.f64_field("CoinJoinDeviceMaxMiningFeeRate", 5.0);
+            let min_inputs = w.km.i64_field("ColdcardMinInputs", 21);
+            let limits = hw::coldcard::policy::Limits {
+                max_sats_leaving: w.km.i64_field("ColdcardMaxSatsLeaving", 100_000),
+                max_transactions: w.km.i64_field("CoinJoinDeviceMaxRounds", 50),
+                max_transactions_per_period: w.km.i64_field("ColdcardMaxTransactionsPerPeriod", 6),
+                period_minutes: w.km.i64_field("ColdcardPeriodMinutes", 60),
+                min_inputs: (min_inputs > 0).then_some(min_inputs),
+                max_fee_per_kvbyte: hw::coldcard::policy::fee_rate_to_per_kvbyte(max_fee),
+            };
+            (
+                w.km.master_fingerprint(),
+                keys,
+                hw::coldcard::policy::compose(&accounts, &limits),
+                w.km.str_field("ColdcardActivePolicyHash").filter(|s| !s.is_empty()).map(str::to_string),
+                w.km.i64_field("CoinJoinDeviceMaxRounds", 50) as usize,
+                max_fee,
+                min_inputs as i32,
+            )
+        };
+        let name = self.wallet_name.clone();
+        let policy_for_log = policy.clone();
+        let policy_fingerprint = hw::coldcard::policy::fingerprint(&policy);
+        let fp = fingerprint.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<(Arc<hw::ColdcardDevice>, Option<String>), String> {
+            let device = hw::ColdcardDevice::open().map_err(|e| format!("DeviceNotFound: {e}"))?;
+            if !device.master_fingerprint.eq_ignore_ascii_case(&fp) {
+                return Err(format!("DeviceNotFound: the connected Coldcard ({}) is not this wallet's ({fp}).", device.master_fingerprint));
+            }
+            let version = device.version().map_err(|e| format!("DeviceNotFound: {e}"))?;
+            tracing::info!("{name}: Coldcard firmware: {}", version.replace('\n', " "));
+            hw::coldcard::policy::ensure_firmware_supports_policy(&version).map_err(|e| format!("DeviceAuthorizationFailed: {e}"))?;
+            tracing::info!("{name}: installing the coinjoin HSM policy; approve it on the Coldcard if it asks. Policy: {policy_for_log}");
+            let active = device.start_hsm(&policy, approved_hash.as_deref()).map_err(|e| {
+                if e.0.contains("Unknown item") {
+                    "DeviceAuthorizationFailed: This Coldcard's firmware does not understand the coinjoin policy. Install the coinjoin-fw-2 build.".to_string()
+                } else {
+                    format!("DeviceAuthorizationFailed: {e}")
+                }
+            })?;
+            Ok((Arc::new(device), active))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        let (device, active_hash) = result;
+        if let Some(h) = &active_hash {
+            let mut w = self.wallet.lock().await;
+            if w.km.str_field("ColdcardActivePolicyHash") != Some(h.as_str()) {
+                w.km.set_field("ColdcardActivePolicyHash", serde_json::json!(h));
+                w.km.set_field("ColdcardApprovedPolicyFingerprint", serde_json::json!(policy_fingerprint));
+                w.km.save().ok();
+            }
+        }
+        let kc = Arc::new(hw::ColdcardKeyChain::new(device, &fingerprint, keys, max_rounds, coinjoin::FeeRate::from_sat_per_vb(max_fee), min_inputs).map_err(|e| e.to_string())?);
+        *self.coldcard.lock().await = Some(kc.clone());
         Ok(kc)
     }
 
