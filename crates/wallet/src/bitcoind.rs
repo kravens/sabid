@@ -26,6 +26,13 @@ pub struct Bitcoind {
 
 /// Private, link-local and CGNAT (Tailscale's 100.64/10) addresses and local names are not routable
 /// from Tor exits; everything else, onion services above all, goes through the proxy.
+/// Core closes an idle RPC connection after `-rpcservertimeout` (30 s by default), and a request
+/// on a connection the server just closed fails instead of being retried. Drop idle connections
+/// first; the 30 s filter poll otherwise hits that race on every other round over Tor.
+fn pooled_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().timeout(Duration::from_secs(300)).connect_timeout(Duration::from_secs(60)).pool_idle_timeout(Duration::from_secs(20))
+}
+
 pub fn needs_proxy(url: &str) -> bool {
     let parsed = reqwest::Url::parse(url).ok();
     let host = parsed.as_ref().and_then(|u| u.host_str()).unwrap_or("").trim_matches(|c| c == '[' || c == ']');
@@ -52,7 +59,7 @@ impl Bitcoind {
         } else {
             credentials.split_once(':').map(|(u, p)| (u.to_string(), p.to_string()))
         };
-        let mut b = reqwest::Client::builder().timeout(Duration::from_secs(300)).connect_timeout(Duration::from_secs(60));
+        let mut b = pooled_builder();
         let mut proxy = None;
         if let Some(s) = socks5 {
             // Onion and public hosts go through Tor; a node on this machine, the LAN or a
@@ -161,7 +168,7 @@ impl Bitcoind {
     /// The same endpoint through its own Tor circuit (the SOCKS username picks it), with pooled
     /// connections: parallel block fetches on distinct circuits add bandwidth instead of sharing one.
     pub fn with_identity(&self, id: u32) -> Result<Self, RpcError> {
-        let mut b = reqwest::Client::builder().timeout(Duration::from_secs(300)).connect_timeout(Duration::from_secs(60));
+        let mut b = pooled_builder();
         if let Some(p) = &self.proxy {
             b = b.proxy(reqwest::Proxy::all(p.replace("sabid-bitcoind:", &format!("sabid-bitcoind-slot{id}:")))?);
         }
