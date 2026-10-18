@@ -143,7 +143,9 @@ pub fn process_batch(km: &mut KeyManager, store: &WalletStore, rows: &[FilterRow
                 }
             }
         }
-        store.set_synced(row.height, &row.block_hash)?;
+        if i + 1 == rows.len() {
+            store.set_synced(row.height, &row.block_hash)?;
+        }
         report.to = row.height;
         next = row.height + 1;
     }

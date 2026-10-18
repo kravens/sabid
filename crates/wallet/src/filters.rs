@@ -67,6 +67,7 @@ impl FilterStore {
             std::fs::create_dir_all(parent).ok();
         }
         let own = Connection::open(own_path)?;
+        own.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
         own.execute_batch(SCHEMA)?;
         Ok(Self { wasabi, own: Mutex::new(own) })
     }

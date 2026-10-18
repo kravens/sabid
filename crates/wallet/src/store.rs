@@ -33,6 +33,8 @@ impl WalletStore {
             std::fs::create_dir_all(parent).ok();
         }
         let conn = Connection::open(path)?;
+        // Many small autocommit writes per scan batch: WAL with NORMAL sync keeps them off fsync.
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS txs (
                 txid BLOB NOT NULL PRIMARY KEY,
