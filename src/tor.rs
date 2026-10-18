@@ -67,7 +67,7 @@ pub async fn ensure_tor(preferred: Option<&str>, tor_binary: Option<&Path>, data
     let lib_dir = bin.parent().map(|p| p.to_path_buf()).unwrap_or_default();
     let ld = std::env::var("LD_LIBRARY_PATH").map(|v| format!("{}:{v}", lib_dir.display())).unwrap_or_else(|_| lib_dir.display().to_string());
     let stderr_log = std::fs::File::create(tor_dir.join("tor.stderr.log")).map(Stdio::from).unwrap_or_else(|_| Stdio::null());
-    let child = Command::new(&bin)
+    let mut child = Command::new(&bin)
         .env("LD_LIBRARY_PATH", ld)
         .args([
             "--SOCKSPort", &format!("{socks} ExtendedErrors KeepAliveIsolateSOCKSAuth"),
@@ -91,5 +91,6 @@ pub async fn ensure_tor(preferred: Option<&str>, tor_binary: Option<&Path>, data
             return Ok(TorHandle { socks, child: Some(child) });
         }
     }
+    let _ = child.kill();
     anyhow::bail!("tor did not open its SOCKS port within 3 minutes; see {}", log.display())
 }

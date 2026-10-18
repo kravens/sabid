@@ -102,6 +102,11 @@ async fn handle_one(ctx: &Ctx, req: &Value) -> Value {
     }
 }
 
+/// Equal without an early exit on the first differing byte (length still shows).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 async fn handle(daemon: Arc<Daemon>, wallet_name: Option<String>, headers: HeaderMap, body: Bytes) -> Response {
     if !daemon.cfg.json_rpc_user.is_empty() {
         let expected = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", daemon.cfg.json_rpc_user, daemon.cfg.json_rpc_password));
@@ -109,7 +114,7 @@ async fn handle(daemon: Arc<Daemon>, wallet_name: Option<String>, headers: Heade
             .get(header::AUTHORIZATION)
             .and_then(|h| h.to_str().ok())
             .and_then(|h| h.strip_prefix("Basic "))
-            .map(|b| b == expected)
+            .map(|b| ct_eq(b.as_bytes(), expected.as_bytes()))
             .unwrap_or(false);
         if !ok {
             return (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, "Basic realm=\"sabid\"")], "").into_response();

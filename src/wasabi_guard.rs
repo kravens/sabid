@@ -13,6 +13,15 @@ pub fn is_wasabi_process(comm: &str, argv: &[String]) -> bool {
 
 /// Description of a running Wasabi process, if any.
 pub fn wasabi_running() -> Option<String> {
+    find_process(is_wasabi_process)
+}
+
+/// Another sabid daemon (not this process), if any.
+pub fn sabid_daemon_running() -> Option<String> {
+    find_process(|comm, argv| comm == "sabid" && argv.iter().any(|a| a == "daemon"))
+}
+
+fn find_process(matches: impl Fn(&str, &[String]) -> bool) -> Option<String> {
     let me = std::process::id();
     for entry in std::fs::read_dir("/proc").ok()?.flatten() {
         let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else { continue };
@@ -21,7 +30,7 @@ pub fn wasabi_running() -> Option<String> {
         }
         let comm = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
         let argv: Vec<String> = std::fs::read(entry.path().join("cmdline")).unwrap_or_default().split(|b| *b == 0).filter(|a| !a.is_empty()).map(|a| String::from_utf8_lossy(a).to_string()).collect();
-        if is_wasabi_process(comm.trim(), &argv) {
+        if matches(comm.trim(), &argv) {
             return Some(format!("{} (pid {pid})", argv.first().cloned().unwrap_or_else(|| comm.trim().to_string())));
         }
     }

@@ -195,7 +195,24 @@ pub async fn call(ctx: &Ctx, method: &str, p: Params) -> Result<Value, RpcError>
                 return Err(RpcError::internal("Wallet is not fully synchronized yet."));
             }
             let m = d.manager(&name).await.map_err(RpcError::internal)?;
-            m.start(password, stop_when_all_mixed, override_pleb_stop).await.map_err(RpcError::internal)?;
+            m.start(password, stop_when_all_mixed, override_pleb_stop, None).await.map_err(RpcError::internal)?;
+            Ok(Value::Null)
+        }
+        "startcoinjoinsweep" => {
+            // Wasabi: coinjoin every coin (private ones too) into another wallet, until stopped.
+            let password = p.str_opt(0, "password");
+            let out_name = p.str_opt(1, "outputWalletName").filter(|n| !n.is_empty()).ok_or_else(|| RpcError::internal("Output wallet name is invalid."))?;
+            let name = ctx.wallet_name.clone().ok_or_else(|| RpcError::internal("Wallet name is invalid or not allowed."))?;
+            if out_name == name {
+                return Err(RpcError::internal("Output wallet name is invalid."));
+            }
+            let w = ctx.wallet().await?;
+            if !w.lock().await.loaded {
+                return Err(RpcError::internal("Wallet is not fully synchronized yet."));
+            }
+            let out = d.load_wallet(&out_name).await.map_err(RpcError::internal)?;
+            let m = d.manager(&name).await.map_err(RpcError::internal)?;
+            m.start(password, false, true, Some(out)).await.map_err(RpcError::internal)?;
             Ok(Value::Null)
         }
         "unlockwallet" => {

@@ -156,6 +156,12 @@ wabisabi_verify(wabisabi_transcript_t* transcript, const wabisabi_statement_t* s
     if (n_stmt != n_proof) {
         return 0;
     }
+    /* A wire proof decides its own counts; the statement decides what the verifier indexes. */
+    for (int k = 0; k < n_stmt; k++) {
+        if (proofs[k].n_responses < statements[k].n_witnesses || proofs[k].n_nonces < statements[k].n_equations) {
+            return 0;
+        }
+    }
 
     /* Scratch for the dense generator matrix. Heap-allocated (≈1.7 MB) rather
      * than a function-local `static` so that wabisabi_verify is reentrant /

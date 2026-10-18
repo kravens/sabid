@@ -14,3 +14,9 @@ uninitialized group element and secp256k1's illegal-argument callback aborted th
 round. Slots at or beyond `n_requested` are now written as zeros and skipped when read, and the
 `val` locals in the FFI entry points are zeroed.
 
+## proof.c: proof counts checked against the statement (2026-10-18)
+
+`wabisabi_verify` indexed `responses[witness_idx]` and the nonces with counts taken from the
+statement while the arrays came from the wire proof; a short proof read out of bounds. The counts
+are now compared up front and a short proof fails verification.
+

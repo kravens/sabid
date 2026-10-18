@@ -61,6 +61,12 @@ enum Cmd {
         #[arg(long)]
         wallet_dir: Option<PathBuf>,
     },
+    /// Copy sabid's wallet file (labels, key states, device settings) back over Wasabi's copy.
+    /// Backs the old file up first; refuses while Wasabi or a sabid daemon runs
+    ExportWallet {
+        #[arg(long)]
+        wallet: String,
+    },
     /// List hardware wallets: Trezor bridge devices and a Coldcard on USB (with its HSM state)
     Devices,
     /// Model Context Protocol server on stdio for agents (thin client of a running daemon)
@@ -128,7 +134,7 @@ async fn main() -> anyhow::Result<()> {
                 let id_ok = if r.is_round_id_matching() { "id ok" } else { "ID MISMATCH" };
                 println!(
                     "- {} {}{} inputs={inputs} outputs={outputs} fee={} sat/vB min_in={} max_in={} max_sugg={} sat inreg_left={}s [{id_ok}]",
-                    &r.id[..16],
+                    r.id.get(..16).unwrap_or(&r.id),
                     phase,
                     if r.is_blame() { " (blame)" } else { "" },
                     p.fee_rate_sat_per_vb(),
@@ -187,6 +193,27 @@ async fn main() -> anyhow::Result<()> {
             }
             sync.abort();
             drop(tor_handle);
+        }
+        Cmd::ExportWallet { wallet } => {
+            if let Some(w) = wasabi_guard::wasabi_running() {
+                anyhow::bail!("Wasabi Wallet is running: {w}. Close it first; it would overwrite the exported file.");
+            }
+            if let Some(s) = wasabi_guard::sabid_daemon_running() {
+                anyhow::bail!("a sabid daemon is running: {s}. Stop it first so the exported file is complete.");
+            }
+            let own = cli.datadir.join("Main/Wallets").join(format!("{wallet}.json"));
+            if !own.exists() {
+                anyhow::bail!("sabid has no copy of '{wallet}' ({})", own.display());
+            }
+            let theirs = config::wasabi_data_dir().join("Wallets").join(format!("{wallet}.json"));
+            if theirs.exists() {
+                let backup = theirs.with_extension(format!("json.bak-{}", chrono::Utc::now().format("%Y%m%d%H%M%S")));
+                std::fs::copy(&theirs, &backup)?;
+                println!("backed up {} to {}", theirs.display(), backup.display());
+            }
+            std::fs::create_dir_all(theirs.parent().unwrap())?;
+            std::fs::copy(&own, &theirs)?;
+            println!("exported {} to {}", own.display(), theirs.display());
         }
         Cmd::ImportWasabiTxs { wallet, wallet_dir } => {
             // sabid's own copy when it has one, else the file Wasabi keeps.

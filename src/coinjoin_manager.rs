@@ -159,6 +159,8 @@ pub struct CoinJoinManager {
     pub cancel: std::sync::Mutex<Option<CancellationToken>>,
     pub in_critical: std::sync::Mutex<bool>,
     pub last_error: std::sync::Mutex<Option<String>>,
+    /// `startcoinjoinsweep`: outputs go to this wallet and every coin is mixed (consolidation mode).
+    pub output_wallet: std::sync::Mutex<Option<Arc<Mutex<LoadedWallet>>>>,
     pub updater: Arc<RoundStateUpdater>,
     pub updater_stop: Arc<Notify>,
     pub prison: Arc<CoinPrison>,
@@ -234,6 +236,7 @@ impl CoinJoinManager {
             cancel: std::sync::Mutex::new(None),
             in_critical: std::sync::Mutex::new(false),
             last_error: std::sync::Mutex::new(None),
+            output_wallet: std::sync::Mutex::new(None),
             updater: updater.clone(),
             updater_stop: Arc::new(Notify::new()),
             prison,
@@ -268,11 +271,12 @@ impl CoinJoinManager {
 
     /// `RequestCoinJoinStart`: builds the key chain now (so a bad password fails here) and
     /// runs rounds in the background until stopped or all coins are private.
-    pub async fn start(self: &Arc<Self>, password: Option<String>, stop_when_all_mixed: bool, override_pleb_stop: bool) -> Result<(), String> {
+    pub async fn start(self: &Arc<Self>, password: Option<String>, stop_when_all_mixed: bool, override_pleb_stop: bool, output_wallet: Option<Arc<Mutex<LoadedWallet>>>) -> Result<(), String> {
         if self.status() != CoinJoinClientState::Idle {
             *self.stop_when_all_mixed.lock().unwrap() = stop_when_all_mixed;
             return Ok(());
         }
+        *self.output_wallet.lock().unwrap() = output_wallet;
         let key_chain: Arc<dyn KeyChain> = {
             let mut w = self.wallet.lock().await;
             if w.km.is_hardware_wallet() {
@@ -496,7 +500,9 @@ impl CoinJoinManager {
         if total < pleb_stop && !*self.override_pleb_stop.lock().unwrap() {
             return Err(format!("NotEnoughUnprivateBalance: the balance {} sat is under the pleb stop threshold {} sat.", total, pleb_stop));
         }
-        if candidates.iter().all(|c| c.is_private(anon_target)) {
+        let output_wallet = self.output_wallet.lock().unwrap().clone();
+        let consolidation = output_wallet.is_some();
+        if !consolidation && candidates.iter().all(|c| c.is_private(anon_target)) {
             if *self.stop_when_all_mixed.lock().unwrap() {
                 tracing::info!("{}: all coins are private, stopping.", self.wallet_name);
                 return Ok(false);
@@ -510,9 +516,9 @@ impl CoinJoinManager {
         let client = CoinJoinClient {
             make_client,
             key_chain: key_chain.clone(),
-            destinations: Arc::new(WalletDestinations { wallet: self.wallet.clone() }),
+            destinations: Arc::new(WalletDestinations { wallet: output_wallet.clone().unwrap_or_else(|| self.wallet.clone()) }),
             updater: self.updater.clone(),
-            selector: CoinJoinCoinSelector::new(false, anon_target, non_private_isolation, false),
+            selector: CoinJoinCoinSelector::new(consolidation, anon_target, non_private_isolation, false),
             config: CoinJoinConfig {
                 coordinator_identifier: d.cfg.coordinator_identifier.clone(),
                 max_mining_fee_rate_sat_vb: key_chain.max_mining_fee_rate().map(|f| f.sat_per_vb()).unwrap_or(d.cfg.max_coin_join_mining_fee_rate).min(d.cfg.max_coin_join_mining_fee_rate),
@@ -589,17 +595,24 @@ impl CoinJoinManager {
         match result {
             Ok(CoinJoinResult::Success { output_scripts, unsigned_tx, costs, .. }) => {
                 tracing::info!("{}: coinjoin finished, transaction {} was broadcast (mining fee {} sat, dust {} sat)", self.wallet_name, unsigned_tx.compute_txid(), costs.mining_fee, costs.wasted_dust);
-                let mut w = self.wallet.lock().await;
-                for s in &output_scripts {
-                    if let Some(k) = w.km.key_for_script_mut(s) {
-                        k.state = KeyState::Used;
-                    }
-                }
                 let now = chrono::Utc::now().timestamp();
-                if let Err(e) = w.store.insert_tx(&unsigned_tx, wallet::store::MEMPOOL_HEIGHT, &bitcoin::BlockHash::all_zeros(), 0, now) {
-                    tracing::warn!("storing coinjoin tx: {e}");
+                // The spending wallet, and the output wallet when sweeping somewhere else.
+                let mut targets = vec![self.wallet.clone()];
+                if let Some(o) = output_wallet.filter(|o| !Arc::ptr_eq(o, &self.wallet)) {
+                    targets.push(o);
                 }
-                w.rebuild_state().map_err(|e| e.to_string())?;
+                for t in targets {
+                    let mut w = t.lock().await;
+                    for s in &output_scripts {
+                        if let Some(k) = w.km.key_for_script_mut(s) {
+                            k.state = KeyState::Used;
+                        }
+                    }
+                    if let Err(e) = w.store.insert_tx(&unsigned_tx, wallet::store::MEMPOOL_HEIGHT, &bitcoin::BlockHash::all_zeros(), 0, now) {
+                        tracing::warn!("storing coinjoin tx: {e}");
+                    }
+                    w.rebuild_state().map_err(|e| e.to_string())?;
+                }
                 Ok(true)
             }
             Ok(CoinJoinResult::Failed) => {

@@ -15,9 +15,9 @@ fn secret_field_name(k: &str) -> bool {
 
 /// Methods an agent may call through the MCP `rpc` tool: nothing that takes a password (soft
 /// wallets are unlocked on the daemon host) and nothing that stops the daemon.
-const AGENT_METHODS: [&str; 18] = [
+const AGENT_METHODS: [&str; 19] = [
     "getstatus", "listwallets", "loadwallet", "selectwallet", "getwalletinfo", "listunspentcoins", "listcoins", "gethistory", "getnewaddress", "listkeys",
-    "excludefromcoinjoin", "getfeerates", "startcoinjoin", "stopcoinjoin", "enumeratedevices", "setcoinjoinlimits", "displayaddress", "lockwallet",
+    "excludefromcoinjoin", "getfeerates", "startcoinjoin", "startcoinjoinsweep", "stopcoinjoin", "enumeratedevices", "setcoinjoinlimits", "displayaddress", "lockwallet",
 ];
 
 fn is_base58(s: &str) -> bool {
@@ -48,7 +48,7 @@ pub fn agent_call(method: &str, params: &mut Value) -> Result<(), String> {
     if !AGENT_METHODS.contains(&m.as_str()) {
         return Err(format!("'{method}' is not available through the MCP (no passwords, no daemon shutdown); run it with `sabid rpc` on the daemon host"));
     }
-    if m == "startcoinjoin" {
+    if m == "startcoinjoin" || m == "startcoinjoinsweep" {
         if let Some(first) = params.as_array_mut().and_then(|a| a.first_mut()) {
             *first = Value::String(String::new());
         }
@@ -83,6 +83,9 @@ mod tests {
         let mut p = json!(["hunter2", true, true]);
         agent_call("startcoinjoin", &mut p).unwrap();
         assert_eq!(p, json!(["", true, true]));
+        let mut sweep = json!(["hunter2", "OtherWallet"]);
+        agent_call("startcoinjoinsweep", &mut sweep).unwrap();
+        assert_eq!(sweep, json!(["", "OtherWallet"]));
         let mut o = json!({"password": "hunter2", "stopWhenAllMixed": false});
         agent_call("startcoinjoin", &mut o).unwrap();
         assert_eq!(o["password"], "");

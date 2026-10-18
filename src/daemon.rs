@@ -368,7 +368,7 @@ impl Daemon {
     }
 
     pub async fn run_sync_loop(self: Arc<Self>) {
-        let mut first = true;
+        let mut iteration: u32 = 0;
         loop {
             if let Some(w) = crate::wasabi_guard::wasabi_running() {
                 self.wasabi_appeared(w).await;
@@ -379,8 +379,8 @@ impl Daemon {
                 Ok(_) => {}
                 Err(e) => tracing::warn!("filters: {e}"),
             }
-            if first {
-                self.update_fee_rates().await;
+            if iteration % 20 == 0 {
+                self.update_fee_rates().await; // about every ten minutes
             }
             let names: Vec<String> = self.wallets.read().await.keys().cloned().collect();
             for n in names {
@@ -388,7 +388,7 @@ impl Daemon {
                     tracing::warn!("sync {n}: {e}");
                 }
             }
-            first = false;
+            iteration = iteration.wrapping_add(1);
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
                 _ = self.shutdown.notified() => return,
