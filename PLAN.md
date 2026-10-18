@@ -115,7 +115,72 @@ Key crates: `bitcoin` 0.32 (tx, script, bip158, psbt, taproot), `secp256k1` (sig
   non-Rust piece and is isolated in `wabisabi-sys`).
 - Tor: reuse an existing SOCKS proxy if one answers; otherwise spawn Wasabi's bundled tor.
 
-## 6. Progress log
+## 6. Experimental directions (design notes, not started)
+
+### 6.1 Hybrid liquidity: JoinMarket makers inside the WabiSabi denomination world
+
+Kruw's "Four Horsemen" idea (https://delvingbitcoin.org/t/the-four-horsemen/2728): one client that
+uses WabiSabi to consolidate and to create ZeroLink-style standard denominations, JoinMarket for
+on-demand liquidity, payjoin for spending. The liquidity of the three pools then overlaps instead
+of fragmenting.
+
+What sabid can contribute first, in order of effort:
+
+1. **Denomination alignment.** `coinjoin/decomposer.rs` already produces Wasabi's standard
+   denomination set (powers of two, three and ten, "lucky" amounts). A JoinMarket maker that offers
+   exactly those amounts lets a WabiSabi-shaped output be remixed in a JoinMarket transaction
+   without a fingerprint. Zero protocol work; a table and a selection rule.
+2. **Maker side.** A `jm` crate: JoinMarket's directory-node message layer (Tor onion services,
+   the JSON-over-onion v2 messaging, fidelity bond announcement), the `!orderbook`/`!fill`/
+   `!auth`/`!ioauth`/`!tx`/`!sig` handshake, and a maker that signs through the existing
+   `KeyChain` trait. A soft wallet signs directly; a Coldcard under the HSM policy already allows
+   "self transfer >= 50 %, bounded fee", which is exactly a maker's position in a JoinMarket
+   transaction (its outputs return to itself plus the coinjoin fee), so the policy covers it with
+   no firmware change. Trezor needs `AuthorizeCoinJoin` with the maker's own output; SLIP-25
+   forbids foreign scripts in the coinjoin account, which may need a plain account instead.
+3. **Taker side.** A taker that fills a JoinMarket transaction with standard-denomination outputs
+   (the decomposer, fed with the maker offers' amounts as "others' inputs") so the result looks
+   like any WabiSabi output set. This is where the "hybrid" lands: a WabiSabi round for the
+   many-small-participants case, a JoinMarket fill for the whale case, both producing the same
+   denominations, chosen per coin by size and by the current orderbook.
+4. **Coordinator-side hybrid** (Kruw's full picture: makers participating inside a WabiSabi
+   round) needs a coordinator change (maker registration with a fee credential) and is out of
+   sabid's scope until a coordinator implements it; keep the client interfaces (`ArenaClient`,
+   credential scheduler) ready to carry an extra "liquidity fee" credential type.
+
+Open questions: JoinMarket's directory nodes and message signing need a libsecp ECDSA path that
+sabid has (`bitcoin` crate); fidelity bonds need a timelocked output type the wallet does not track
+yet; privacy of mixing the two pools (a coin seen in both a WabiSabi round and a JoinMarket
+transaction links two coordinators' views) must be analysed before defaulting to it.
+
+### 6.2 Payjoin v2 (BIP 77) receive and send through Payjoin Dev Kit
+
+The `payjoin` crate (https://github.com/payjoin/rust-payjoin, 1.0, `v2` feature on by default) does
+the protocol: OHTTP to a relay, a directory holding the encrypted session, BIP 21 URIs with `pj=`
+and `pjos=`, receiver and sender state machines with session persistence. sabid supplies wallet
+plumbing:
+
+- **Receive.** `getnewaddress` grows a `payjoin: true` option that creates a receiver session
+  (relay + directory from `Config.json`, defaults to a public mailroom), returns the BIP 21 URI with
+  the `pj` parameter and keeps the session in `~/.sabid/payjoin/<wallet>/`. A loop polls the
+  directory, validates the original PSBT with the node (`gettxout`), picks one of our coins to
+  contribute (segwit or taproot, same type as the sender's inputs when possible), signs it through
+  the `KeyChain` (soft wallet now; Coldcard under HSM only if the policy allows the output set,
+  which is the open question for devices), and posts the payjoin PSBT. The sender broadcasts.
+- **Send.** Needs ordinary sending first (`build`/`broadcast`, milestone M4). Then `send` with a
+  `pj` URI builds the original PSBT, drives the sender state machine through the relay, verifies
+  the receiver's proposal (no change to our outputs beyond the rules, fee within tolerance), signs
+  the added inputs' counterpart through the `KeyChain`, broadcasts.
+- **Taproot** is only an input/output script type here; the crate is agnostic, the wallet's
+  taproot account (`TaprootExtPubKey`) already derives keys and the Coldcard key chain signs
+  taproot under the HSM.
+- **Compatibility with Wasabi's data**: payjoin sessions are sabid-only state, nothing in the
+  wallet file changes; a wallet file stays loadable by Wasabi.
+
+Testing: PDK ships a test fixture and `payjoin-cli`; a receive round trip against `payjoin-cli
+send` on regtest is the acceptance test, the same setup used for the Wasabi payjoin work.
+
+## 7. Progress log
 
 - 2026-10-17 M0 done: credential roundtrips against the C issuer through coordinator JSON
   (zero, real, reissue, presentation-only); round ids of live coinjoin.kruw.io rounds verify.

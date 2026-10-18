@@ -3,7 +3,7 @@
 //! spend one transaction of the device's HSM policy budget. Needs the wallet file of the connected
 //! device (its keys and master fingerprint) and an active HSM policy:
 //!
-//!   SABID_WALLET_JSON=/tmp/sabid-wallets/ColdCardTest.json SABID_BENCH_FOREIGN=330 SABID_BENCH_OUTPUTS=403 \
+//!   SABID_WALLET_JSON=~/.walletwasabi/client/Wallets/MyColdcard.json SABID_BENCH_FOREIGN=330 SABID_BENCH_OUTPUTS=403 \
 //!   cargo test -p hw --release --test coldcard_timing -- --ignored --nocapture
 
 use bitcoin::absolute::LockTime;
