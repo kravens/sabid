@@ -62,7 +62,9 @@ sabid status [--coordinator URL]           # rounds, phases, timeouts, round-id 
 sabid devices                              # Trezor bridge devices, a Coldcard on USB with its HSM state
 sabid import-wasabi-txs --wallet MyWallet  # seed the tx store from Wasabi's ConfirmedTransactions, no rescan
 sabid rpc getwalletinfo --wallet MyWallet  # any RPC method, params as a JSON array or object
-sabid rpc startcoinjoin '["password", true, true]' --wallet MyWallet
+sabid unlock --wallet MyWallet [--ttl 3600]  # soft wallet: type the password here, the daemon keeps the key for --ttl seconds
+sabid lock --wallet MyWallet
+sabid rpc startcoinjoin --wallet MyWallet  # no password once unlocked (or pass '["password", true, true]')
 sabid mcp [--url http://127.0.0.1:37128/]  # MCP server on stdio
 ```
 
@@ -88,7 +90,9 @@ curl -s -u user:pass http://127.0.0.1:37128/MyWallet \
 | `listkeys` | | |
 | `excludefromcoinjoin` | `[txid, index, exclude]` | |
 | `getfeerates` | | from the node's `estimatesmartfee` |
-| `startcoinjoin` | `[password, stopWhenAllMixed, overridePlebStop]` | password is ignored for device wallets |
+| `unlockwallet` | `[password, ttlSeconds]` | soft wallets: decrypt the key in the daemon for `ttlSeconds` (default 3600, max 86400); `getwalletinfo.unlocked` |
+| `lockwallet` | | erase the decrypted key and stop a running coinjoin after its round |
+| `startcoinjoin` | `[password, stopWhenAllMixed, overridePlebStop]` | empty password uses the unlocked key; device wallets need none |
 | `stopcoinjoin` | | takes effect after the critical phase |
 | `enumeratedevices` | | HWI-shaped list |
 | `setcoinjoinlimits` | `[maxRounds, maxFeeRate, minInputs]` | device limits, Coldcard re-approves its policy |
@@ -132,7 +136,19 @@ or in any MCP client config:
 Tools: `getstatus`, `listwallets`, `loadwallet`, `getwalletinfo`, `listunspentcoins`,
 `gethistory`, `getnewaddress` (label required), `startcoinjoin`, `stopcoinjoin`,
 `enumeratedevices`, and `rpc` (any method, `{"method", "params", "wallet"}`) for the rest. Wallet
-tools take `{"wallet": "<name>"}`. Amounts are satoshis. Example exchange:
+tools take `{"wallet": "<name>"}`. Amounts are satoshis.
+
+Secrets never cross the MCP channel: no tool takes a password (`startcoinjoin` has none; a soft
+wallet is unlocked on the daemon host with `sabid unlock`, which types the password into the
+daemon's memory for a limited time, 24 h at most, and `getwalletinfo.unlocked` tells an agent
+whether that has happened); the `rpc` passthrough only forwards an allowlist of agent-safe methods
+(no `unlockwallet`, no `stop`, no method that takes a password) and blanks the password slot of
+`startcoinjoin`; and both the daemon (`src/secrets.rs`, applied to every RPC answer) and the MCP
+client refuse to forward an answer that contains key material (fields named like secrets, chain
+codes, mnemonics, passwords or private keys, or strings shaped like `xprv`/`zprv`, WIF or BIP 38
+keys). `sabid lock` erases the cached key and ends a running coinjoin after its round, since that
+round holds its own copy. No RPC method reads the wallet's encrypted secret except the unlock path.
+Example exchange:
 
 ```json
 {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"getwalletinfo","arguments":{"wallet":"MyWallet"}}}

@@ -59,6 +59,9 @@ pub async fn call(ctx: &Ctx, method: &str, p: Params) -> Result<Value, RpcError>
                 let status = d.managers.read().await.get(&km.wallet_name()).map(|m| m.status().as_wasabi()).unwrap_or("Idle");
                 info["coinjoinStatus"] = json!(status);
             }
+            if !km.is_hardware_wallet() && !km.is_watch_only() {
+                info["unlocked"] = json!(lw.is_unlocked());
+            }
             if let Some((h, tip)) = lw.sync_progress {
                 info["syncProgress"] = json!({"height": h, "tip": tip});
             }
@@ -193,6 +196,34 @@ pub async fn call(ctx: &Ctx, method: &str, p: Params) -> Result<Value, RpcError>
             }
             let m = d.manager(&name).await.map_err(RpcError::internal)?;
             m.start(password, stop_when_all_mixed, override_pleb_stop).await.map_err(RpcError::internal)?;
+            Ok(Value::Null)
+        }
+        "unlockwallet" => {
+            const MAX_UNLOCK_SECS: u64 = 24 * 3600;
+            let password = p.str_opt(0, "password").unwrap_or_default();
+            let ttl = p.u64_or(1, "ttlSeconds", 3600).min(MAX_UNLOCK_SECS);
+            let w = ctx.wallet().await?;
+            let (enc, cc, network) = {
+                let lw = w.lock().await;
+                if lw.km.is_hardware_wallet() {
+                    return Err(RpcError::internal("A hardware wallet has no password to unlock."));
+                }
+                let (Some(enc), Some(cc)) = (lw.km.encrypted_secret(), lw.km.chain_code()) else { return Err(RpcError::internal("This is a watch-only wallet.")) };
+                (enc.to_string(), cc.to_string(), lw.km.network())
+            };
+            let master = crate::coinjoin_manager::decrypt_master_blocking(enc, cc, password, network).await.map_err(RpcError::internal)?;
+            w.lock().await.unlocked = Some((master, std::time::SystemTime::now() + std::time::Duration::from_secs(ttl)));
+            Ok(Value::Null)
+        }
+        "lockwallet" => {
+            let w = ctx.wallet().await?;
+            w.lock().await.lock();
+            // A running coinjoin holds its own copy of the key: end it (after the critical phase).
+            if let Some(name) = &ctx.wallet_name {
+                if let Some(m) = d.managers.read().await.get(name) {
+                    m.stop();
+                }
+            }
             Ok(Value::Null)
         }
         "stopcoinjoin" => {

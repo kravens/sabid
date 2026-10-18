@@ -1578,6 +1578,7 @@ dependencies = [
  "wabisabi",
  "wallet",
  "wasabi-proto",
+ "zeroize",
 ]
 
 [[package]]

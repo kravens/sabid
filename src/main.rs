@@ -4,6 +4,7 @@ mod daemon;
 mod mcp;
 mod methods;
 mod rpc;
+mod secrets;
 mod tor;
 
 use clap::{Parser, Subcommand};
@@ -64,6 +65,25 @@ enum Cmd {
     /// Model Context Protocol server on stdio for agents (thin client of a running daemon)
     Mcp {
         /// RPC URL of the daemon (default: from Config.json)
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// Decrypt a soft wallet's key with a password typed here and keep it in the daemon's memory
+    /// for a while, so startcoinjoin (also from agents over MCP) needs no password
+    Unlock {
+        #[arg(long)]
+        wallet: String,
+        /// Seconds to stay unlocked
+        #[arg(long, default_value_t = 3600)]
+        ttl: u64,
+        /// RPC URL (default: from Config.json)
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// Forget a wallet's decrypted key in the daemon
+    Lock {
+        #[arg(long)]
+        wallet: String,
         #[arg(long)]
         url: Option<String>,
     },
@@ -211,26 +231,82 @@ async fn main() -> anyhow::Result<()> {
             client.serve_stdio().await?;
         }
         Cmd::Rpc { method, params, wallet, url } => {
-            let base = url.unwrap_or_else(|| cfg.json_rpc_server_prefixes.first().cloned().unwrap_or_else(|| "http://127.0.0.1:37128/".into()));
-            let target = match wallet {
-                Some(w) => format!("{}/{}/", base.trim_end_matches('/'), w),
-                None => base.clone(),
-            };
             let params: serde_json::Value = match params {
                 Some(p) => serde_json::from_str(&p)?,
                 None => serde_json::json!([]),
             };
-            let body = serde_json::json!({"jsonrpc": "2.0", "id": "1", "method": method, "params": params});
-            let mut req = reqwest::Client::builder().timeout(std::time::Duration::from_secs(120)).build()?.post(&target).header("content-type", "application/json").body(body.to_string());
-            if !cfg.json_rpc_user.is_empty() {
-                req = req.basic_auth(&cfg.json_rpc_user, Some(&cfg.json_rpc_password));
-            }
-            let text = req.send().await?.text().await?;
-            match serde_json::from_str::<serde_json::Value>(&text) {
-                Ok(v) => println!("{}", serde_json::to_string_pretty(&v)?),
-                Err(_) => println!("{text}"),
-            }
+            println!("{}", serde_json::to_string_pretty(&rpc_call(&cfg, url, wallet.as_deref(), &method, params).await?)?);
+        }
+        Cmd::Unlock { wallet, ttl, url } => {
+            use zeroize::Zeroize;
+            let mut password = read_password(&format!("Password for wallet {wallet}: "))?;
+            let r = rpc_result(&cfg, url, Some(&wallet), "unlockwallet", serde_json::json!([password, ttl])).await;
+            password.zeroize();
+            r?;
+            println!("{wallet} unlocked for {ttl} s; startcoinjoin needs no password until then.");
+        }
+        Cmd::Lock { wallet, url } => {
+            rpc_result(&cfg, url, Some(&wallet), "lockwallet", serde_json::json!([])).await?;
+            println!("{wallet} locked; a running coinjoin ends after its round.");
         }
     }
     Ok(())
+}
+
+/// The `result` of a JSON-RPC call, or the daemon's error message as an error.
+async fn rpc_result(cfg: &config::WasabiConfig, url: Option<String>, wallet: Option<&str>, method: &str, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    let v = rpc_call(cfg, url, wallet, method, params).await?;
+    if let Some(e) = v.get("error").filter(|e| !e.is_null()) {
+        anyhow::bail!("{}", e.get("message").and_then(|m| m.as_str()).unwrap_or("error"));
+    }
+    Ok(v.get("result").cloned().unwrap_or(serde_json::Value::Null))
+}
+
+/// One JSON-RPC call to a running daemon; the parsed reply (result or error object).
+async fn rpc_call(cfg: &config::WasabiConfig, url: Option<String>, wallet: Option<&str>, method: &str, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    let base = url.unwrap_or_else(|| cfg.json_rpc_server_prefixes.first().cloned().unwrap_or_else(|| "http://127.0.0.1:37128/".into()));
+    let target = match wallet {
+        Some(w) => format!("{}/{}/", base.trim_end_matches('/'), w),
+        None => base.clone(),
+    };
+    let body = serde_json::json!({"jsonrpc": "2.0", "id": "1", "method": method, "params": params});
+    let mut req = reqwest::Client::builder().timeout(std::time::Duration::from_secs(120)).build()?.post(&target).header("content-type", "application/json").body(body.to_string());
+    if !cfg.json_rpc_user.is_empty() {
+        req = req.basic_auth(&cfg.json_rpc_user, Some(&cfg.json_rpc_password));
+    }
+    let resp = req.send().await?;
+    let status = resp.status();
+    let text = resp.text().await?;
+    serde_json::from_str(&text).map_err(|_| anyhow::anyhow!("daemon answered HTTP {status}: {text}"))
+}
+
+/// A line typed at the terminal with echo off (`stty`, nothing to link). Piped stdin is read as is;
+/// a terminal without a working `stty` is refused rather than echoing the password.
+fn read_password(prompt: &str) -> anyhow::Result<String> {
+    use std::io::{BufRead, IsTerminal, Write};
+    let echo_on = || {
+        let _ = std::process::Command::new("stty").arg("echo").status();
+    };
+    let terminal = std::io::stdin().is_terminal();
+    if terminal {
+        if !std::process::Command::new("stty").arg("-echo").status().map(|s| s.success()).unwrap_or(false) {
+            anyhow::bail!("cannot turn terminal echo off (no `stty`); not reading a password in the clear");
+        }
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            echo_on();
+            eprintln!();
+            std::process::exit(130);
+        });
+    }
+    eprint!("{prompt}");
+    std::io::stderr().flush()?;
+    let mut line = String::new();
+    let read = std::io::stdin().lock().read_line(&mut line);
+    if terminal {
+        echo_on();
+        eprintln!();
+    }
+    read?;
+    Ok(line.trim_end_matches(['\n', '\r']).to_string())
 }

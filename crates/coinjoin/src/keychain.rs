@@ -60,8 +60,13 @@ pub struct SoftKeyChain {
 }
 
 impl SoftKeyChain {
-    /// `KeyManager.GetMasterExtKey`: BIP38 `EncryptedSecret` + base64 `ChainCode`.
-    pub fn new(encrypted_secret: &str, chain_code_b64: &str, password: &str, network: Network, paths: HashMap<ScriptBuf, DerivationPath>) -> Result<Self, KeyChainError> {
+    pub fn from_master(master: Xpriv, paths: HashMap<ScriptBuf, DerivationPath>) -> Self {
+        Self { secp: Secp256k1::new(), master, paths }
+    }
+
+    /// `KeyManager.GetMasterExtKey`: BIP38 `EncryptedSecret` + base64 `ChainCode`. The only place a
+    /// password is ever used.
+    pub fn decrypt_master(encrypted_secret: &str, chain_code_b64: &str, password: &str, network: Network) -> Result<Xpriv, KeyChainError> {
         use base64::Engine;
         use bip38::Decrypt;
         let (key, _compressed) = encrypted_secret.decrypt(password).map_err(|e| KeyChainError::Other(format!("Invalid passphrase ({e:?})")))?;
@@ -75,7 +80,7 @@ impl SoftKeyChain {
             private_key: SecretKey::from_slice(&key).map_err(|e| KeyChainError::Other(e.to_string()))?,
             chain_code: ChainCode::from(cc),
         };
-        Ok(Self { secp: Secp256k1::new(), master, paths })
+        Ok(master)
     }
 
     pub fn add_path(&mut self, script: ScriptBuf, path: DerivationPath) {

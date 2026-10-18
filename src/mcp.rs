@@ -16,7 +16,7 @@ fn tools() -> Vec<Tool> {
         Tool { name: "getstatus", description: "Daemon status: Tor, best block height, filters left, network.", schema: json!({"type": "object", "properties": {}}) },
         Tool { name: "listwallets", description: "Wallet files the daemon can load.", schema: json!({"type": "object", "properties": {}}) },
         Tool { name: "loadwallet", description: "Load (and start syncing) a wallet.", schema: json!({"type": "object", "properties": wallet_prop, "required": ["wallet"]}) },
-        Tool { name: "getwalletinfo", description: "Wallet info: loaded, balance (sat), coinjoin status, device settings, accounts.", schema: json!({"type": "object", "properties": wallet_prop, "required": ["wallet"]}) },
+        Tool { name: "getwalletinfo", description: "Wallet info: loaded, balance (sat), coinjoin status, unlocked (soft wallets), device settings, accounts.", schema: json!({"type": "object", "properties": wallet_prop, "required": ["wallet"]}) },
         Tool { name: "listunspentcoins", description: "Unspent coins with amount (sat), anonymity score, label, confirmations.", schema: json!({"type": "object", "properties": wallet_prop, "required": ["wallet"]}) },
         Tool { name: "gethistory", description: "Transaction history (amount delta in sat, height, coinjoin flag).", schema: json!({"type": "object", "properties": wallet_prop, "required": ["wallet"]}) },
         Tool {
@@ -26,8 +26,8 @@ fn tools() -> Vec<Tool> {
         },
         Tool {
             name: "startcoinjoin",
-            description: "Start coinjoining a wallet (soft wallet: password; hardware wallet: the device asks to authorize rounds).",
-            schema: json!({"type": "object", "properties": {"wallet": {"type": "string"}, "password": {"type": "string"}, "stopWhenAllMixed": {"type": "boolean", "default": true}, "overridePlebStop": {"type": "boolean", "default": true}}, "required": ["wallet"]}),
+            description: "Start coinjoining a wallet. A soft wallet must be unlocked on the daemon host first (`sabid unlock --wallet NAME`, see getwalletinfo.unlocked); a hardware wallet asks on the device. No password is ever passed here.",
+            schema: json!({"type": "object", "properties": {"wallet": {"type": "string"}, "stopWhenAllMixed": {"type": "boolean", "default": true}, "overridePlebStop": {"type": "boolean", "default": true}}, "required": ["wallet"]}),
         },
         Tool { name: "stopcoinjoin", description: "Stop coinjoining a wallet (after the critical phase).", schema: json!({"type": "object", "properties": wallet_prop, "required": ["wallet"]}) },
         Tool { name: "enumeratedevices", description: "Hardware wallets reachable through the Trezor bridge.", schema: json!({"type": "object", "properties": {}}) },
@@ -61,7 +61,11 @@ impl McpClient {
         if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
             return Err(err.get("message").and_then(Value::as_str).unwrap_or("error").to_string());
         }
-        Ok(v.get("result").cloned().unwrap_or(Value::Null))
+        let result = v.get("result").cloned().unwrap_or(Value::Null);
+        if let Some(what) = crate::secrets::looks_secret(&result) {
+            return Err(format!("refused: the daemon answer contained {what}"));
+        }
+        Ok(result)
     }
 
     async fn handle_tool(&self, name: &str, args: &Value) -> Result<Value, String> {
@@ -78,14 +82,14 @@ impl McpClient {
                 self.call("getnewaddress", json!([label, taproot]), Some(need_wallet()?)).await
             }
             "startcoinjoin" => {
-                let password = args.get("password").and_then(Value::as_str).unwrap_or("");
                 let stop = args.get("stopWhenAllMixed").and_then(Value::as_bool).unwrap_or(true);
                 let pleb = args.get("overridePlebStop").and_then(Value::as_bool).unwrap_or(true);
-                self.call("startcoinjoin", json!([password, stop, pleb]), Some(need_wallet()?)).await
+                self.call("startcoinjoin", json!(["", stop, pleb]), Some(need_wallet()?)).await
             }
             "rpc" => {
                 let method = args.get("method").and_then(Value::as_str).ok_or("method is required")?;
-                let params = args.get("params").cloned().unwrap_or(json!([]));
+                let mut params = args.get("params").cloned().unwrap_or(json!([]));
+                crate::secrets::agent_call(method, &mut params)?;
                 self.call(method, params, wallet).await
             }
             _ => Err(format!("unknown tool {name}")),

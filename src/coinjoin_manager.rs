@@ -2,7 +2,8 @@
 //! coin candidates, pleb stop, auto-restart until all coins are private, bans, result handling.
 
 use crate::daemon::{Daemon, LoadedWallet};
-use bitcoin::bip32::DerivationPath;
+use bitcoin::bip32::{DerivationPath, Xpriv};
+use bitcoin::Network;
 use bitcoin::{OutPoint, ScriptBuf};
 use coinjoin::client::{CjError, CoinJoinClient, CoinJoinConfig, CoinJoinResult, CoinjoinError, Progress};
 use coinjoin::destinations::DestinationProvider;
@@ -168,6 +169,18 @@ pub struct CoinJoinManager {
 
 pub const PLEB_STOP_DEFAULT_SATS: i64 = 1_000_000;
 
+/// BIP 38 scrypt takes a second and 16 MiB: run it on a blocking thread, and wipe the password after.
+pub async fn decrypt_master_blocking(enc: String, cc: String, mut password: String, network: Network) -> Result<Xpriv, String> {
+    use zeroize::Zeroize;
+    tokio::task::spawn_blocking(move || {
+        let r = SoftKeyChain::decrypt_master(&enc, &cc, &password, network).map_err(|e| e.to_string());
+        password.zeroize();
+        r
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 fn candidate_coins(w: &LoadedWallet, prison: &CoinPrison) -> (Vec<CjCoin>, Vec<coinjoin::client::CoinjoinError>) {
     let hardware_taproot_only = w.km.has_slip25_account();
     let mut reasons = Vec::new();
@@ -252,19 +265,25 @@ impl CoinJoinManager {
             return Ok(());
         }
         let key_chain: Arc<dyn KeyChain> = {
-            let w = self.wallet.lock().await;
+            let mut w = self.wallet.lock().await;
             if w.km.is_hardware_wallet() {
                 drop(w);
                 self.device_key_chain().await?
             } else {
-            let (Some(enc), Some(cc)) = (w.km.encrypted_secret(), w.km.chain_code()) else { return Err("This is a watch-only wallet.".into()) };
-            let mut paths: HashMap<ScriptBuf, DerivationPath> = HashMap::new();
-            for k in &w.km.keys {
-                if let Some(p) = derivation_path(&k.path) {
-                    paths.insert(k.script.clone(), p);
-                }
-            }
-            Arc::new(SoftKeyChain::new(enc, cc, password.as_deref().unwrap_or(""), w.km.network(), paths).map_err(|e| e.to_string())?)
+                let (Some(enc), Some(cc)) = (w.km.encrypted_secret(), w.km.chain_code()) else { return Err("This is a watch-only wallet.".into()) };
+                let (enc, cc, network) = (enc.to_string(), cc.to_string(), w.km.network());
+                let paths: HashMap<ScriptBuf, DerivationPath> = w.km.keys.iter().filter_map(|k| derivation_path(&k.path).map(|p| (k.script.clone(), p))).collect();
+                let cached = w.unlocked_master();
+                drop(w);
+                let master = match (password.filter(|p| !p.is_empty()), cached) {
+                    (Some(p), _) => decrypt_master_blocking(enc, cc, p, network).await?,
+                    (None, Some(m)) => m,
+                    // A wallet without a password keeps working as before; anything else is locked.
+                    (None, None) => decrypt_master_blocking(enc, cc, String::new(), network)
+                        .await
+                        .map_err(|_| format!("Wallet is locked. Run `sabid unlock --wallet {}` on the daemon host, or pass the password.", self.wallet_name))?,
+                };
+                Arc::new(SoftKeyChain::from_master(master, paths))
             }
         };
         *self.stop_when_all_mixed.lock().unwrap() = stop_when_all_mixed;

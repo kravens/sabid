@@ -53,6 +53,9 @@ impl Params {
     pub fn str_opt(&self, idx: usize, name: &str) -> Option<String> {
         self.get(idx, name).and_then(|v| v.as_str()).map(str::to_string)
     }
+    pub fn u64_or(&self, idx: usize, name: &str, default: u64) -> u64 {
+        self.v.get(idx).or_else(|| self.v.get(name)).and_then(Value::as_u64).unwrap_or(default)
+    }
     pub fn bool_or(&self, idx: usize, name: &str, default: bool) -> bool {
         self.get(idx, name).and_then(|v| v.as_bool()).unwrap_or(default)
     }
@@ -88,7 +91,13 @@ async fn handle_one(ctx: &Ctx, req: &Value) -> Value {
     };
     let params = Params { v: req.get("params").cloned().unwrap_or(Value::Array(vec![])) };
     match dispatch(ctx, method, params).await {
-        Ok(result) => json!({"jsonrpc": "2.0", "result": result, "id": id}),
+        Ok(result) => match crate::secrets::looks_secret(&result) {
+            Some(what) => {
+                tracing::error!("{method}: refused to answer with {what}");
+                error_response(id, -32000, "refused: the answer contained key material")
+            }
+            None => json!({"jsonrpc": "2.0", "result": result, "id": id}),
+        },
         Err(e) => error_response(id, e.code, &e.message),
     }
 }

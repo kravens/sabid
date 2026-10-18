@@ -19,9 +19,30 @@ pub struct LoadedWallet {
     pub loaded: bool,
     pub sync_progress: Option<(u32, u32)>,
     pub last_error: Option<String>,
+    /// Decrypted master key of a soft wallet and its wall-clock expiry (`unlockwallet`).
+    pub unlocked: Option<(bitcoin::bip32::Xpriv, std::time::SystemTime)>,
 }
 
 impl LoadedWallet {
+    pub fn is_unlocked(&self) -> bool {
+        matches!(&self.unlocked, Some((_, until)) if std::time::SystemTime::now() < *until)
+    }
+
+    /// The cached master key while it lasts; an expired one is erased here.
+    pub fn unlocked_master(&mut self) -> Option<bitcoin::bip32::Xpriv> {
+        if self.is_unlocked() {
+            return self.unlocked.map(|(m, _)| m);
+        }
+        self.lock();
+        None
+    }
+
+    pub fn lock(&mut self) {
+        if let Some((mut m, _)) = self.unlocked.take() {
+            m.private_key.non_secure_erase();
+        }
+    }
+
     pub fn rebuild_state(&mut self) -> anyhow::Result<()> {
         let txs = self.store.all_txs()?;
         let (state, changed) = WalletState::build(&txs, &mut self.km);
@@ -134,7 +155,7 @@ impl Daemon {
             anyhow::bail!("wallet '{name}' is for {:?}, daemon runs {:?}", km.network(), self.network);
         }
         let store = WalletStore::open(&self.datadir.join(network_dir_name(self.network)).join(format!("{name}.sqlite")))?;
-        let mut lw = LoadedWallet { km, store, state: WalletState::default(), loaded: false, sync_progress: None, last_error: None };
+        let mut lw = LoadedWallet { km, store, state: WalletState::default(), loaded: false, sync_progress: None, last_error: None, unlocked: None };
         lw.rebuild_state()?;
         let w = Arc::new(Mutex::new(lw));
         self.wallets.write().await.insert(name.to_string(), w.clone());
