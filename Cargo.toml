@@ -19,7 +19,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [package]
 name = "sabid"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Rust re-implementation of the Wasabi Wallet daemon (WabiSabi coinjoin client, JSON-RPC, CLI, MCP)"
 license = "MIT"
