@@ -1,6 +1,7 @@
 mod coinjoin_manager;
 mod config;
 mod daemon;
+mod devices;
 mod mcp;
 mod methods;
 mod rpc;

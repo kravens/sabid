@@ -23,33 +23,29 @@ fn network_name(n: Network) -> &'static str {
     }
 }
 
-/// The file's JSON, in Wasabi's field order, with no keys yet (`ensure_gap` fills them).
-pub fn wallet_json(mnemonic: &bip39::Mnemonic, password: &str, network: Network, birth_height: u32) -> anyhow::Result<Map<String, Value>> {
-    let secp = Secp256k1::new();
-    let mut seed = mnemonic.to_seed(password);
-    let master = Xpriv::new_master(network, &seed)?;
-    seed.zeroize();
-    let mut secret = master.private_key.secret_bytes();
-    let encrypted = secret.encrypt(password, true).map_err(|e| anyhow::anyhow!("BIP 38: {e:?}"))?;
-    secret.zeroize();
+/// Account key paths as Wasabi writes them (`84'/0'/0'`, `86'/0'/0'`, SLIP-25 `10025'/0'/0'/1'`).
+pub fn account_path(purpose: u32, network: Network) -> String {
     let coin = if network == Network::Bitcoin { 0 } else { 1 };
-    let segwit_path = format!("84'/{coin}'/0'");
-    let taproot_path = format!("86'/{coin}'/0'");
-    let account_xpub = |p: &str| -> anyhow::Result<String> {
-        let path: DerivationPath = format!("m/{p}").parse()?;
-        Ok(Xpub::from_priv(&secp, &master.derive_priv(&secp, &path)?).to_string())
-    };
-    let obj = json!({
-        "EncryptedSecret": encrypted,
-        "ChainCode": base64::engine::general_purpose::STANDARD.encode(master.chain_code.as_bytes()),
-        "MasterFingerprint": hex::encode(master.fingerprint(&secp).to_bytes()),
-        "ExtPubKey": account_xpub(&segwit_path)?,
-        "TaprootExtPubKey": account_xpub(&taproot_path)?,
+    if purpose == 10025 {
+        format!("10025'/{coin}'/0'/1'")
+    } else {
+        format!("{purpose}'/{coin}'/0'")
+    }
+}
+
+/// Wasabi's field order and defaults; secrets, xpubs and vendor fields are filled by the callers.
+fn defaults(network: Network, birth_height: u32, segwit_path: &str) -> Map<String, Value> {
+    json!({
+        "EncryptedSecret": null,
+        "ChainCode": null,
+        "MasterFingerprint": null,
+        "ExtPubKey": null,
+        "TaprootExtPubKey": null,
         "SilentPaymentScanExtPubKey": null,
         "SilentPaymentSpendExtPubKey": null,
         "MinGapLimit": MIN_GAP_LIMIT,
         "AccountKeyPath": segwit_path,
-        "TaprootAccountKeyPath": taproot_path,
+        "TaprootAccountKeyPath": null,
         "BlockchainState": {"Network": network_name(network), "Height": birth_height.to_string(), "BirthHeight": birth_height},
         "PreferPsbtWorkflow": false,
         "AutoCoinJoin": false,
@@ -72,24 +68,72 @@ pub fn wallet_json(mnemonic: &bip39::Mnemonic, password: &str, network: Network,
         "DefaultSendWorkflow": "Automatic",
         "ExcludedCoinsFromCoinJoin": [],
         "HdPubKeys": [],
-    });
-    Ok(obj.as_object().cloned().expect("object"))
+    })
+    .as_object()
+    .cloned()
+    .expect("object")
 }
 
-/// Writes the wallet file (refusing to overwrite) and derives its first keys.
-pub fn write_wallet(path: &Path, mnemonic: &bip39::Mnemonic, password: &str, network: Network, birth_height: u32) -> anyhow::Result<KeyManager> {
+/// A soft wallet's JSON, with no keys yet (`ensure_gap` fills them).
+pub fn wallet_json(mnemonic: &bip39::Mnemonic, password: &str, network: Network, birth_height: u32) -> anyhow::Result<Map<String, Value>> {
+    let secp = Secp256k1::new();
+    let mut seed = mnemonic.to_seed(password);
+    let master = Xpriv::new_master(network, &seed)?;
+    seed.zeroize();
+    let mut secret = master.private_key.secret_bytes();
+    let encrypted = secret.encrypt(password, true).map_err(|e| anyhow::anyhow!("BIP 38: {e:?}"))?;
+    secret.zeroize();
+    let segwit_path = account_path(84, network);
+    let taproot_path = account_path(86, network);
+    let account_xpub = |p: &str| -> anyhow::Result<String> {
+        let path: DerivationPath = format!("m/{p}").parse()?;
+        Ok(Xpub::from_priv(&secp, &master.derive_priv(&secp, &path)?).to_string())
+    };
+    let mut m = defaults(network, birth_height, &segwit_path);
+    m.insert("EncryptedSecret".into(), json!(encrypted));
+    m.insert("ChainCode".into(), json!(base64::engine::general_purpose::STANDARD.encode(master.chain_code.as_bytes())));
+    m.insert("MasterFingerprint".into(), json!(hex::encode(master.fingerprint(&secp).to_bytes())));
+    m.insert("ExtPubKey".into(), json!(account_xpub(&segwit_path)?));
+    m.insert("TaprootExtPubKey".into(), json!(account_xpub(&taproot_path)?));
+    m.insert("TaprootAccountKeyPath".into(), json!(taproot_path));
+    Ok(m)
+}
+
+/// A hardware wallet's watch-only JSON (`KeyManager.CreateNewHardwareWalletWatchOnly`): segwit account
+/// always, a taproot or SLIP-25 account when the device gave one, `vendor` 1 = Trezor, 2 = Coldcard.
+pub fn watch_only_json(network: Network, birth_height: u32, fingerprint_hex: &str, segwit_xpub: &str, taproot: Option<(&str, &str)>, icon: &str, vendor: i64) -> Map<String, Value> {
+    let mut m = defaults(network, birth_height, &account_path(84, network));
+    m.insert("MasterFingerprint".into(), json!(fingerprint_hex));
+    m.insert("ExtPubKey".into(), json!(segwit_xpub));
+    if let Some((path, xpub)) = taproot {
+        m.insert("TaprootAccountKeyPath".into(), json!(path));
+        m.insert("TaprootExtPubKey".into(), json!(xpub));
+    } else {
+        // Nothing to hand out from a taproot account the device has not given.
+        m.insert("DefaultReceiveScriptType".into(), json!("Segwit"));
+    }
+    m.insert("Icon".into(), json!(icon));
+    m.insert("CoinJoinVendor".into(), json!(vendor));
+    m
+}
+
+/// Writes a new wallet file (refusing to overwrite) and derives its first keys.
+pub fn write_json(path: &Path, map: Map<String, Value>) -> anyhow::Result<KeyManager> {
     if path.exists() {
         anyhow::bail!("{} already exists", path.display());
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let map = wallet_json(mnemonic, password, network, birth_height)?;
     std::fs::write(path, serde_json::to_string_pretty(&Value::Object(map))?)?;
     let mut km = KeyManager::load(path)?;
     km.ensure_gap();
     km.save()?;
     Ok(km)
+}
+
+pub fn write_wallet(path: &Path, mnemonic: &bip39::Mnemonic, password: &str, network: Network, birth_height: u32) -> anyhow::Result<KeyManager> {
+    write_json(path, wallet_json(mnemonic, password, network, birth_height)?)
 }
 
 #[cfg(test)]
@@ -112,6 +156,19 @@ mod tests {
         let master = Xpriv::new_master(Network::Bitcoin, &m.to_seed("")).unwrap();
         assert_eq!(key, master.private_key.secret_bytes());
         assert!(write_wallet(&path, &m, "", Network::Bitcoin, 1).is_err(), "never overwrite");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn watch_only_file_loads_as_a_hardware_wallet() {
+        let dir = std::env::temp_dir().join(format!("sabid-hw-{}", std::process::id()));
+        let segwit = "xpub6CatWdiZiodmUeTDp8LT5or8nmbKNcuyvz7WyksVFkKB4RHwCD3XyuvPEbvqAQY3rAPshWcMLoP2fMFMKHPJ4ZeZXYVUhLv1VMrjPC7PW6V";
+        let km = write_json(&dir.join("Hw.json"), watch_only_json(Network::Bitcoin, 800_000, "73c5da0a", segwit, None, "Coldcard", 2)).unwrap();
+        assert!(km.is_hardware_wallet() && km.is_watch_only());
+        assert_eq!(km.i64_field("CoinJoinVendor", 0), 2);
+        assert!(km.taproot_xpub().is_none());
+        assert_eq!(km.keys.len() as u32, 2 * MIN_GAP_LIMIT);
+        assert_eq!(account_path(10025, Network::Bitcoin), "10025'/0'/0'/1'");
         std::fs::remove_dir_all(dir).ok();
     }
 }

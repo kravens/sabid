@@ -19,10 +19,10 @@ design notes and the progress log.
   account over the bridge API), Coldcard Mk4 on the `coinjoin-fw-2` firmware (hidraw, HSM policy).
 - Wasabi-compatible JSON-RPC, a CLI, an MCP server.
 
-Not yet: sending outside coinjoin (`send`, `build`, `broadcast`, `payincoinjoin`), hardware
-wallet import and `enablecoinjoin` over RPC, mempool scanning for foreign transactions, Passport
-and Krux, pure-Rust WabiSabi crypto (the vendored C library is used through FFI).
-`startcoinjoinsweep` (coinjoin into another wallet) exists but has not run live yet.
+Not yet: sending outside coinjoin (`send`, `build`, `broadcast`, `payincoinjoin`), mempool
+scanning for foreign transactions, Passport and Krux, pure-Rust WabiSabi crypto (the vendored C
+library is used through FFI). `startcoinjoinsweep` (coinjoin into another wallet) and the device
+import/enable methods exist but have not run live end to end yet.
 
 ## Build
 
@@ -111,7 +111,10 @@ curl -s -u user:pass http://127.0.0.1:37128/MyWallet \
 | `startcoinjoin` | `[password, stopWhenAllMixed, overridePlebStop]` | empty password uses the unlocked key; device wallets need none |
 | `startcoinjoinsweep` | `[password, outputWalletName]` | coinjoin every coin, private ones too, into another loaded wallet until stopped |
 | `stopcoinjoin` | | takes effect after the critical phase |
-| `enumeratedevices` | | HWI-shaped list |
+| `enumeratedevices` | | HWI-shaped list: a Coldcard on USB, Trezors on the bridge |
+| `importhardwarewallet` | `[walletName, enableCoinjoin, birthHeight?]` | watch-only file from the connected device (Coldcard must not be in HSM mode); Trezor with coinjoin gets its SLIP-25 account |
+| `enablecoinjoin` | | device wallet: Trezor adds the SLIP-25 account and rescans, Coldcard records itself as the signer |
+| `enabletaproot` | | Coldcard wallet imported segwit-only: adds the `86'` account and rescans |
 | `setcoinjoinlimits` | `[maxRounds, maxFeeRate, minInputs]` | device limits, Coldcard re-approves its policy |
 | `displayaddress` | `[address]` | on the device screen |
 | `stop` | | |
@@ -128,10 +131,10 @@ launch `wassabeed` itself, while sabid you start by hand. Flow:
 3. `python3 sabi.py --rpc http://127.0.0.1:37128 --wallet MyWallet`.
 
 sabi's coinjoin dashboard, coin list, history, receive, start/stop and device limits use methods
-sabid has. Screens that call `payincoinjoin`, `listpaymentsincoinjoin`, `startcoinjoinsweep`,
-`importhardwarewallet` or `enablecoinjoin` get a "method not found" error from sabid until those
-land (see `PLAN.md`); `startcoinjoinsweep`, `createwallet` and `recoverwallet` work; `wcli.sh`
-style one-liners work as is.
+sabid has. Screens that call `payincoinjoin` or `listpaymentsincoinjoin` get a "method not
+found" error from sabid until those land (see `PLAN.md`); `startcoinjoinsweep`, `createwallet`,
+`recoverwallet`, `importhardwarewallet` and `enablecoinjoin` work; `wcli.sh` style one-liners
+work as is.
 
 ## MCP
 

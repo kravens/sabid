@@ -268,9 +268,74 @@ pub async fn call(ctx: &Ctx, method: &str, p: Params) -> Result<Value, RpcError>
             }
             Ok(Value::Null)
         }
+        "importhardwarewallet" => {
+            let name = p.str(0, "walletName")?;
+            let enable_coinjoin = p.bool_or(1, "enableCoinjoin", false);
+            let birth = p.u64_or(2, "birthHeight", wallet::filters::SEGWIT_ACTIVATION_HEIGHT as u64) as u32;
+            let path = d.new_wallet_path(&name).map_err(RpcError::internal)?;
+            let (dev, fp) = crate::devices::find(None).await.map_err(RpcError::internal)?;
+            let segwit = crate::devices::account_xpub(&dev, &wallet::create::account_path(84, d.network), d.network).await.map_err(RpcError::internal)?;
+            // Trezor coinjoins from its SLIP-25 account; a Coldcard from this segwit account under its HSM policy.
+            let slip25 = wallet::create::account_path(10025, d.network);
+            let taproot = match (&dev, enable_coinjoin) {
+                (crate::devices::Device::Trezor(_), true) => Some((slip25.as_str(), crate::devices::account_xpub(&dev, &slip25, d.network).await.map_err(RpcError::internal)?)),
+                _ => None,
+            };
+            let vendor = if enable_coinjoin { dev.vendor() } else { 0 };
+            let km = wallet::create::write_json(&path, wallet::create::watch_only_json(d.network, birth, &fp, &segwit, taproot.as_ref().map(|(p, x)| (*p, x.as_str())), dev.icon(), vendor)).map_err(RpcError::internal)?;
+            Ok(json!({"walletName": name, "masterKeyFingerprint": fp, "accounts": accounts(&km), "verifiedAddresses": []}))
+        }
+        "enablecoinjoin" | "enabletaproot" => {
+            let w = ctx.wallet().await?;
+            let mut lw = w.lock().await;
+            if !lw.km.is_hardware_wallet() {
+                return Err(RpcError::internal("Only a hardware wallet needs this; a soft wallet coinjoins as it is."));
+            }
+            if method == "enablecoinjoin" && lw.km.i64_field("CoinJoinVendor", 0) != 0 {
+                return Ok(json!({"accounts": accounts(&lw.km), "verifiedAddresses": []}));
+            }
+            let fp = lw.km.master_fingerprint();
+            let (dev, _) = crate::devices::find(Some(&fp)).await.map_err(|e| RpcError::internal(format!("The device of this wallet is not connected: {e}")))?;
+            let add_account = |lw: &mut crate::daemon::LoadedWallet, purpose: u32, xpub: String| {
+                lw.km.set_field("TaprootAccountKeyPath", json!(wallet::create::account_path(purpose, d.network)));
+                lw.km.set_field("TaprootExtPubKey", json!(xpub));
+                lw.km.set_field("DefaultReceiveScriptType", json!("Taproot"));
+            };
+            match (method, &dev) {
+                ("enablecoinjoin", crate::devices::Device::Coldcard(_)) => lw.km.set_field("CoinJoinVendor", json!(2)),
+                ("enablecoinjoin", crate::devices::Device::Trezor(_)) => {
+                    if lw.km.taproot_xpub().is_some() {
+                        return Err(RpcError::internal("Only a hardware wallet without a taproot account can take a coinjoin account."));
+                    }
+                    let xpub = crate::devices::account_xpub(&dev, &wallet::create::account_path(10025, d.network), d.network).await.map_err(RpcError::internal)?;
+                    add_account(&mut lw, 10025, xpub);
+                    lw.km.set_field("ChangeScriptPubKeyType", json!("Segwit"));
+                    lw.km.set_field("CoinJoinVendor", json!(1));
+                }
+                (_, crate::devices::Device::Coldcard(_)) => {
+                    if lw.km.taproot_xpub().is_some() {
+                        return Err(RpcError::internal("This wallet already has a taproot account."));
+                    }
+                    let xpub = crate::devices::account_xpub(&dev, &wallet::create::account_path(86, d.network), d.network).await.map_err(RpcError::internal)?;
+                    add_account(&mut lw, 86, xpub);
+                }
+                _ => return Err(RpcError::internal("A Trezor's taproot account comes with its coinjoin account (enablecoinjoin).")),
+            }
+            lw.km.save().map_err(RpcError::internal)?;
+            if lw.km.taproot_xpub().is_none() && method == "enablecoinjoin" {
+                // Coldcard: the file changed but no account did, nothing to scan again.
+                return Ok(json!({"accounts": accounts(&lw.km), "verifiedAddresses": []}));
+            }
+            d.reload_wallet_for_rescan(&mut lw).await.map_err(RpcError::internal)?;
+            Ok(json!({"accounts": accounts(&lw.km), "verifiedAddresses": []}))
+        }
         "enumeratedevices" => {
-            let devices = hw::TrezorDevice::enumerate().await.map_err(|e| RpcError::internal(e.0))?;
-            Ok(Value::Array(
+            let mut list = Vec::new();
+            if let Ok(Ok(cc)) = tokio::task::spawn_blocking(hw::ColdcardDevice::open).await {
+                list.push(json!({"model": "Coldcard Mk4", "masterKeyFingerprint": cc.master_fingerprint, "initialized": true, "canSignCoinJoins": true, "vendor": "Coldcard", "needsPin": false, "needsPassphrase": false, "firmware": "", "path": "hidraw", "error": ""}));
+            }
+            let devices = hw::TrezorDevice::enumerate().await.unwrap_or_default();
+            list.extend(
                 devices
                     .into_iter()
                     .map(|dv| {
@@ -286,9 +351,9 @@ pub async fn call(ctx: &Ctx, method: &str, p: Params) -> Result<Value, RpcError>
                             "path": dv.path,
                             "error": dv.error.unwrap_or_default(),
                         })
-                    })
-                    .collect(),
-            ))
+                    }),
+            );
+            Ok(Value::Array(list))
         }
         "setcoinjoinlimits" => {
             let w = ctx.wallet().await?;

@@ -132,15 +132,36 @@ impl Daemon {
         }))
     }
 
-    /// A new wallet file in sabid's wallet directory; the name must be free there and in Wasabi's.
-    pub fn create_wallet(&self, name: &str, mnemonic: &bip39::Mnemonic, password: &str, birth_height: u32) -> anyhow::Result<()> {
+    /// Where a new wallet file goes; the name must be free here and in Wasabi's directory.
+    pub fn new_wallet_path(&self, name: &str) -> anyhow::Result<PathBuf> {
         if name.is_empty() || name.contains(['/', '\\']) || name == ".." || name.ends_with(".json") {
             anyhow::bail!("Invalid wallet name.");
         }
         if self.wallet_files().iter().any(|n| n == name) {
             anyhow::bail!("Wallet '{name}' already exists.");
         }
-        wallet::create::write_wallet(&self.wallet_dir.join(format!("{name}.json")), mnemonic, password, self.network, birth_height)?;
+        Ok(self.wallet_dir.join(format!("{name}.json")))
+    }
+
+    pub fn create_wallet(&self, name: &str, mnemonic: &bip39::Mnemonic, password: &str, birth_height: u32) -> anyhow::Result<()> {
+        wallet::create::write_wallet(&self.new_wallet_path(name)?, mnemonic, password, self.network, birth_height)?;
+        Ok(())
+    }
+
+    /// After an account was added to the file: re-read it, derive its keys, and scan again from the
+    /// birth height so coins the new account already holds are found.
+    pub async fn reload_wallet_for_rescan(&self, lw: &mut LoadedWallet) -> anyhow::Result<()> {
+        lw.km = KeyManager::load(&lw.km.path)?;
+        lw.km.ensure_gap();
+        lw.km.save()?;
+        let birth = lw.km.birth_height().unwrap_or(wallet::filters::SEGWIT_ACTIVATION_HEIGHT).max(wallet::filters::SEGWIT_ACTIVATION_HEIGHT);
+        lw.store.rollback_above(birth.saturating_sub(1))?;
+        match self.filters.lock().await.get(birth.saturating_sub(1)) {
+            Some(row) => lw.store.set_synced(row.height, &row.block_hash)?,
+            None => tracing::warn!("{}: no filter at {birth}, the new account is scanned from the next sync", lw.km.wallet_name()),
+        }
+        lw.rebuild_state()?;
+        lw.loaded = false;
         Ok(())
     }
 

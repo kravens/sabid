@@ -15,9 +15,10 @@ fn secret_field_name(k: &str) -> bool {
 
 /// Methods an agent may call through the MCP `rpc` tool: nothing that takes a password (soft
 /// wallets are unlocked on the daemon host) and nothing that stops the daemon.
-const AGENT_METHODS: [&str; 19] = [
+const AGENT_METHODS: [&str; 22] = [
     "getstatus", "listwallets", "loadwallet", "selectwallet", "getwalletinfo", "listunspentcoins", "listcoins", "gethistory", "getnewaddress", "listkeys",
     "excludefromcoinjoin", "getfeerates", "startcoinjoin", "startcoinjoinsweep", "stopcoinjoin", "enumeratedevices", "setcoinjoinlimits", "displayaddress", "lockwallet",
+    "importhardwarewallet", "enablecoinjoin", "enabletaproot",
 ];
 
 fn is_base58(s: &str) -> bool {
@@ -28,7 +29,8 @@ fn is_base58(s: &str) -> bool {
 /// shaped like an extended private key (BIP 32 / SLIP-132), a WIF key or a BIP 38 blob.
 pub fn looks_secret(v: &Value) -> Option<String> {
     match v {
-        Value::Object(m) => m.iter().find_map(|(k, v)| if secret_field_name(k) { Some(format!("field '{k}'")) } else { looks_secret(v) }),
+        // A secret-shaped name matters only when it holds text (`needsPassphrase: false` carries nothing).
+        Value::Object(m) => m.iter().find_map(|(k, v)| if secret_field_name(k) && !matches!(v, Value::Null | Value::Bool(_) | Value::Number(_)) { Some(format!("field '{k}'")) } else { looks_secret(v) }),
         Value::Array(a) => a.iter().find_map(looks_secret),
         Value::String(s) => {
             let b = s.as_bytes();
@@ -72,6 +74,7 @@ mod tests {
         assert!(looks_secret(&json!({"masterKey": "x"})).is_some());
         assert!(looks_secret(&json!({"seed": "x", "wif": "y"})).is_some());
         assert!(looks_secret(&json!({"masterKeyFingerprint": "8c000000", "seedHeight": 1})).is_none());
+        assert!(looks_secret(&json!({"needsPassphrase": false, "needsPin": true, "EncryptedSecret": null})).is_none());
         assert!(looks_secret(&json!(["xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi"])).is_some());
         assert!(looks_secret(&json!({"k": "6PRVWUbkzzgVpRZkRECALL7bhCq6ngRZaHazjbmskWKnVWX9hxyq2P1xfm"})).is_some());
         assert!(looks_secret(&json!({"k": "L1aW4aubDFB7yfras2S1mN3bqg9nwySY8nkoLmJebSLD5BWv3ENZ"})).is_some());
