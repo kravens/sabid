@@ -116,6 +116,14 @@ async fn main() -> anyhow::Result<()> {
                     p.max_suggested_amount,
                     remaining.num_seconds(),
                 );
+                println!(
+                    "  timeouts: confirmation {}s, output registration {}s, signing {}s; coordination id '{}'; delay signing {}",
+                    p.connection_confirmation_timeout.secs(),
+                    p.output_registration_timeout.secs(),
+                    p.transaction_signing_timeout.secs(),
+                    p.coordination_identifier,
+                    p.delay_transaction_signing
+                );
                 if r.phase() == Some(Phase::Ended) {
                     println!("  end state: {:?}", r.end_round_state());
                 }

@@ -135,3 +135,5 @@ Key crates: `bitcoin` 0.32 (tx, script, bip158, psbt, taproot), `secp256k1` (sig
   daemon's own coinjoins are tracked unconfirmed), remaining RPC (send/build/broadcast/payincoinjoin/
   sweep/recover/create/import/enable/displayaddress/setcoinjoinlimits), MCP server, Coldcard/
   Passport/Krux, input verification via bitcoind gettxout, pure-Rust crypto.
+
+- 2026-10-18: Coldcard device timing measured through `crates/hw/tests/coldcard_timing.rs` (ignored test, needs the device in HSM mode): a kruw-shaped 331-input / 403-output round is a 41 KB PSBT and takes the Mk4 (coinjoin-fw-2, 6.6.1X) 175 s end to end, 4.25 ms/byte; kruw.io gives 57 s to sign, so kruw rounds are out of reach for a Coldcard. coinjoin.nl (max 100 inputs, 129 s) fits. The same test found that the 6.6.1X firmware fails ("Signing failed late") when a foreign input has no witness UTXO, so `ColdcardKeyChain::create_psbt` now attaches every input's UTXO. `sabid status` prints the phase timeouts.

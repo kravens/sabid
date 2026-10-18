@@ -76,17 +76,17 @@ impl ColdcardKeyChain {
     }
 
     /// The PSBT the device signs a round from, and which inputs are ours (Wasabi `ColdcardKeyChain.CreatePsbt`).
+    /// Every input carries its witness UTXO: the 6.6.1X coinjoin firmware fails late ("Signing failed late")
+    /// when a foreign input has none, measured 2026-10-18; the 5.6.0 line tolerated it. Costs ~30% more
+    /// bytes and ~5-8% more device time.
     pub fn create_psbt(&self, unsigned: &UnsignedCoinJoin) -> Result<(Psbt, HashSet<OutPoint>), KeyChainError> {
         let keys = self.keys.lock().unwrap();
         let is_ours: Vec<bool> = unsigned.prevouts.iter().map(|o| keys.contains_key(&o.script_pubkey)).collect();
-        let signs_taproot = unsigned.prevouts.iter().zip(&is_ours).any(|(o, ours)| *ours && o.script_pubkey.is_p2tr());
         let mut psbt = Psbt::from_unsigned_tx(unsigned.tx.clone()).map_err(|e| KeyChainError::Other(format!("psbt: {e}")))?;
         let mut ours = HashSet::new();
         for (i, input) in psbt.inputs.iter_mut().enumerate() {
             let prevout = &unsigned.prevouts[i];
-            if is_ours[i] || signs_taproot {
-                input.witness_utxo = Some(prevout.clone());
-            }
+            input.witness_utxo = Some(prevout.clone());
             if is_ours[i] {
                 ours.insert(unsigned.tx.input[i].previous_output);
                 let k = &keys[&prevout.script_pubkey];
