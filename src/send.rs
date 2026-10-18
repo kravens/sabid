@@ -20,8 +20,6 @@ pub struct Built {
     pub tx: Transaction,
     pub prevouts: Vec<TxOut>,
     pub fee: u64,
-    /// The change script when the transaction has a change output.
-    pub change: Option<ScriptBuf>,
 }
 
 /// nVersion, nLockTime, input and output counts, segwit marker: the part no input or output pays for.
@@ -94,7 +92,20 @@ pub fn build(coins: &[Coin], payments: &[Payment], fee_rate_sat_vb: f64, change:
     };
     let prevouts = coins.iter().map(|c| TxOut { value: Amount::from_sat(c.amount), script_pubkey: c.script.clone() }).collect();
     let fee = total_in - outputs.iter().map(|(_, a)| a).sum::<u64>();
-    Ok(Built { tx, prevouts, fee, change: change_out.map(|_| change) })
+    Ok(Built { tx, prevouts, fee })
+}
+
+/// Virtual size estimate of a transaction we know the prevouts of (same rule as `build`).
+pub fn vsize(tx: &Transaction, prevouts: &[TxOut]) -> i64 {
+    OVERHEAD_VBYTES + prevouts.iter().map(|p| script_input_vsize(&p.script_pubkey)).sum::<i64>() + tx.output.iter().map(|o| script_output_vsize(&o.script_pubkey)).sum::<i64>()
+}
+
+/// Fee rate for a replacement (BIP 125): a clearly higher rate, and an absolute fee that pays for
+/// the old fee plus the replacement's own relay cost.
+pub fn replacement_rate(old_fee: u64, old_vsize: i64, new_vsize: i64) -> f64 {
+    let old_rate = old_fee as f64 / old_vsize.max(1) as f64;
+    let by_absolute = (old_fee as f64 + new_vsize as f64 + 1.0) / new_vsize.max(1) as f64;
+    (old_rate * 1.25).max(old_rate + 1.0).max(by_absolute).min(MAX_FEE_RATE)
 }
 
 pub fn sign(key_chain: &dyn KeyChain, built: &Built) -> Result<Transaction, String> {
@@ -141,7 +152,6 @@ mod tests {
         assert_eq!(b.fee, (10.0 * vsize as f64).ceil() as u64);
         assert_eq!(b.tx.output.len(), 2);
         assert_eq!(b.tx.output.iter().map(|o| o.value.to_sat()).sum::<u64>(), 150_000 - b.fee);
-        assert!(b.change.is_some());
         assert!(b.tx.input.iter().all(|i| i.sequence == Sequence::ENABLE_RBF_NO_LOCKTIME));
     }
 
@@ -156,9 +166,17 @@ mod tests {
     }
 
     #[test]
+    fn replacement_pays_more_in_rate_and_in_total() {
+        let r = replacement_rate(2000, 200, 150);
+        assert!(r >= 10.0 * 1.25);
+        assert!(r * 150.0 >= 2000.0 + 150.0, "absolute fee covers the old fee plus relay");
+        assert!(replacement_rate(1_000_000, 100, 100) <= MAX_FEE_RATE);
+    }
+
+    #[test]
     fn dust_change_is_left_as_fee_and_shortfalls_fail() {
         let b = build(&[coin(0, 100_000)], &[Payment { script: spk(9), amount: 99_500, subtract_fee: false }], 1.0, spk(7), 1000).unwrap();
-        assert!(b.change.is_none(), "the remainder is below dust");
+        assert_eq!(b.tx.output.len(), 1, "the remainder is below dust, no change");
         assert_eq!(b.fee, 500);
         assert!(build(&[coin(0, 1_000)], &[Payment { script: spk(9), amount: 990, subtract_fee: false }], 1.0, spk(7), 500).is_err());
         assert!(build(&[coin(0, 100_000)], &[Payment { script: spk(9), amount: 100, subtract_fee: false }], 1.0, spk(7), 1000).is_err(), "dust payment");

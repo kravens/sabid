@@ -297,13 +297,14 @@ pub async fn call(ctx: &Ctx, method: &str, p: Params) -> Result<Value, RpcError>
             };
             let password = p.str_opt(4, "password");
             let w = ctx.wallet().await?;
-            let (coins, change) = {
+            let (coins, change, hardware) = {
                 let mut lw = w.lock().await;
                 if !lw.loaded {
                     return Err(RpcError::internal("Wallet is not fully synchronized yet."));
                 }
-                if lw.km.is_hardware_wallet() {
-                    return Err(RpcError::internal("Sending from a hardware wallet is not supported yet; it can only coinjoin here."));
+                let hardware = lw.km.is_hardware_wallet();
+                if hardware && lw.km.i64_field("CoinJoinVendor", 0) != 2 {
+                    return Err(RpcError::internal("Sending from this hardware wallet is not supported yet (a Coldcard can sign plain transactions here; a Trezor only coinjoins)."));
                 }
                 let coins: Vec<wallet::store::Coin> = outpoints
                     .iter()
@@ -313,36 +314,88 @@ pub async fn call(ctx: &Ctx, method: &str, p: Params) -> Result<Value, RpcError>
                 lw.km.keys[idx].state = wallet::KeyState::Locked;
                 lw.km.keys[idx].label = label.clone();
                 lw.km.save().map_err(RpcError::internal)?;
-                (coins, lw.km.keys[idx].script.clone())
+                (coins, lw.km.keys[idx].script.clone(), hardware)
             };
             let dust = (d.cfg.dust_threshold.parse::<f64>().unwrap_or(0.00001) * 1e8).round() as u64;
             let built = crate::send::build(&coins, &payments, fee_rate, change.clone(), dust).map_err(RpcError::internal)?;
-            let kc = crate::coinjoin_manager::soft_key_chain(&w, password, &name).await.map_err(RpcError::internal)?;
-            let tx = crate::send::sign(&*kc, &built).map_err(RpcError::internal)?;
+            let kc: std::sync::Arc<dyn coinjoin::keychain::KeyChain> = if hardware {
+                crate::devices::coldcard_signer(&w).await.map_err(RpcError::internal)?
+            } else {
+                crate::coinjoin_manager::soft_key_chain(&w, password, &name).await.map_err(RpcError::internal)?
+            };
+            let fee = built.fee;
+            let tx = tokio::task::spawn_blocking(move || crate::send::sign(&*kc, &built)).await.map_err(|e| RpcError::internal(e.to_string()))?.map_err(RpcError::internal)?;
             let hex = bitcoin::consensus::encode::serialize_hex(&tx);
-            tracing::info!("{name}: {method} {} input(s), {} output(s), fee {} sat at {fee_rate} sat/vB", tx.input.len(), tx.output.len(), built.fee);
+            tracing::info!("{name}: {method} {} input(s), {} output(s), fee {fee} sat at {fee_rate} sat/vB", tx.input.len(), tx.output.len());
             if method == "build" {
                 return Ok(Value::String(hex));
             }
             let node = d.bitcoind.as_ref().ok_or_else(|| RpcError::internal("No Bitcoin Core node configured: use build and broadcast the transaction elsewhere."))?;
             let txid = node.send_raw_transaction(&hex).await.map_err(|e| RpcError::internal(format!("broadcast: {e}")))?;
-            {
-                let mut lw = w.lock().await;
-                lw.store.insert_tx(&tx, wallet::store::MEMPOOL_HEIGHT, &<bitcoin::BlockHash as bitcoin::hashes::Hash>::all_zeros(), 0, chrono::Utc::now().timestamp()).map_err(RpcError::internal)?;
-                if built.change.is_some() {
-                    if let Some(k) = lw.km.key_for_script_mut(&change) {
-                        k.state = wallet::KeyState::Used;
-                    }
-                }
-                lw.km.save().map_err(RpcError::internal)?;
-                lw.rebuild_state().map_err(RpcError::internal)?;
-            }
+            d.note_broadcast(&tx).await;
             Ok(json!({"txid": txid.to_string(), "tx": hex}))
+        }
+        "canceltransaction" | "speeduptransaction" => {
+            // RBF replacement of an unconfirmed transaction of ours: cancel sends everything back to a
+            // fresh internal key; speed up keeps the payments and takes the extra fee from the change.
+            let txid: bitcoin::Txid = p.str(0, "txId")?.parse().map_err(|_| RpcError::invalid_params("txId"))?;
+            let password = p.str_opt(1, "password");
+            let name = ctx.wallet_name.clone().ok_or_else(|| RpcError::internal("Wallet name is invalid or not allowed."))?;
+            let w = ctx.wallet().await?;
+            let dust = (d.cfg.dust_threshold.parse::<f64>().unwrap_or(0.00001) * 1e8).round() as u64;
+            let (coins, payments, change, old_fee, old_vsize, hardware) = {
+                let mut lw = w.lock().await;
+                if !lw.store.mempool_txs().unwrap_or_default().iter().any(|(t, _)| *t == txid) {
+                    return Err(RpcError::internal("Transaction is not an unconfirmed transaction of this wallet."));
+                }
+                let tx = lw.store.get_tx(&txid).ok_or_else(|| RpcError::internal("Transaction not found."))?;
+                let coins: Vec<wallet::store::Coin> = tx
+                    .input
+                    .iter()
+                    .map(|i| lw.state.coins.iter().find(|c| c.outpoint == i.previous_output).cloned().ok_or_else(|| RpcError::internal("Not every input of the transaction belongs to this wallet.")))
+                    .collect::<Result<_, _>>()?;
+                let prevouts: Vec<bitcoin::TxOut> = coins.iter().map(|c| bitcoin::TxOut { value: bitcoin::Amount::from_sat(c.amount), script_pubkey: c.script.clone() }).collect();
+                let total_in: u64 = coins.iter().map(|c| c.amount).sum();
+                let total_out: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+                let old_fee = total_in.saturating_sub(total_out);
+                let old_vsize = crate::send::vsize(&tx, &prevouts);
+                let hardware = lw.km.is_hardware_wallet();
+                if hardware && lw.km.i64_field("CoinJoinVendor", 0) != 2 {
+                    return Err(RpcError::internal("Only a soft wallet or a Coldcard can sign the replacement here."));
+                }
+                let idx = lw.km.next_change_key(false).ok_or_else(|| RpcError::internal("No change key available."))?;
+                lw.km.keys[idx].state = wallet::KeyState::Locked;
+                let fresh = lw.km.keys[idx].script.clone();
+                let payments: Vec<crate::send::Payment> = if method == "canceltransaction" {
+                    lw.km.keys[idx].label = "cancelled transaction".into();
+                    vec![crate::send::Payment { script: fresh.clone(), amount: total_in, subtract_fee: true }]
+                } else {
+                    // The extra fee comes from an output that is ours (the change); the rest stay as they are.
+                    let is_ours = |s: &bitcoin::ScriptBuf| lw.km.key_for_script(s).is_some();
+                    let payer = tx.output.iter().rposition(|o| is_ours(&o.script_pubkey)).ok_or_else(|| RpcError::internal("No change output to take the extra fee from; cancel the transaction instead."))?;
+                    tx.output.iter().enumerate().map(|(i, o)| crate::send::Payment { script: o.script_pubkey.clone(), amount: o.value.to_sat(), subtract_fee: i == payer }).collect()
+                };
+                lw.km.save().map_err(RpcError::internal)?;
+                (coins, payments, fresh, old_fee, old_vsize, hardware)
+            };
+            let new_vsize = crate::send::vsize(&bitcoin::Transaction { version: bitcoin::transaction::Version::TWO, lock_time: bitcoin::absolute::LockTime::ZERO, input: vec![], output: payments.iter().map(|pm| bitcoin::TxOut { value: bitcoin::Amount::from_sat(pm.amount), script_pubkey: pm.script.clone() }).collect() }, &coins.iter().map(|c| bitcoin::TxOut { value: bitcoin::Amount::from_sat(c.amount), script_pubkey: c.script.clone() }).collect::<Vec<_>>());
+            let rate = crate::send::replacement_rate(old_fee, old_vsize, new_vsize);
+            let built = crate::send::build(&coins, &payments, rate, change, dust).map_err(|e| RpcError::internal(format!("{e} (replacement at {rate:.1} sat/vB)")))?;
+            let kc: std::sync::Arc<dyn coinjoin::keychain::KeyChain> = if hardware {
+                crate::devices::coldcard_signer(&w).await.map_err(RpcError::internal)?
+            } else {
+                crate::coinjoin_manager::soft_key_chain(&w, password, &name).await.map_err(RpcError::internal)?
+            };
+            let tx = tokio::task::spawn_blocking(move || crate::send::sign(&*kc, &built)).await.map_err(|e| RpcError::internal(e.to_string()))?.map_err(RpcError::internal)?;
+            tracing::info!("{name}: {method} of {txid} built at {rate:.1} sat/vB");
+            Ok(Value::String(bitcoin::consensus::encode::serialize_hex(&tx)))
         }
         "broadcast" => {
             let hex = p.str(0, "txHex")?;
+            let tx: bitcoin::Transaction = bitcoin::consensus::encode::deserialize_hex(&hex).map_err(|e| RpcError::invalid_params(format!("txHex: {e}")))?;
             let node = d.bitcoind.as_ref().ok_or_else(|| RpcError::internal("No Bitcoin Core node configured."))?;
             let txid = node.send_raw_transaction(&hex).await.map_err(|e| RpcError::internal(format!("broadcast: {e}")))?;
+            d.note_broadcast(&tx).await;
             Ok(json!({"txid": txid.to_string()}))
         }
         "stopcoinjoin" => {

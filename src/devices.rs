@@ -47,6 +47,21 @@ pub async fn find(fingerprint: Option<&str>) -> Result<(Device, String), String>
     Ok((Device::Trezor(t), fp))
 }
 
+/// A Coldcard key chain for one plain transaction: outside HSM mode the device asks the user to
+/// confirm it on screen; in HSM mode its policy decides. No coinjoin policy is installed here.
+pub async fn coldcard_signer(wallet: &std::sync::Arc<tokio::sync::Mutex<crate::daemon::LoadedWallet>>) -> Result<std::sync::Arc<dyn coinjoin::keychain::KeyChain>, String> {
+    let (fp, keys, max_fee) = {
+        let w = wallet.lock().await;
+        let keys: std::collections::HashMap<bitcoin::ScriptBuf, hw::ColdcardKeyInfo> =
+            w.km.keys.iter().filter(|k| k.kind != wallet::AccountKind::Other).map(|k| (k.script.clone(), hw::ColdcardKeyInfo { path: k.path.clone(), pubkey: k.pubkey.inner })).collect();
+        (w.km.master_fingerprint(), keys, w.km.f64_field("CoinJoinDeviceMaxMiningFeeRate", 5.0))
+    };
+    let (dev, found) = find(Some(&fp)).await?;
+    let Device::Coldcard(cc) = dev else { return Err(format!("The connected device ({found}) is not this wallet's Coldcard.")) };
+    let kc = hw::ColdcardKeyChain::new(cc, &fp, keys, 1, coinjoin::FeeRate::from_sat_per_vb(max_fee), 0).map_err(|e| e.to_string())?;
+    Ok(Arc::new(kc))
+}
+
 pub async fn account_xpub(dev: &Device, path: &str, network: Network) -> Result<String, String> {
     match dev {
         Device::Coldcard(cc) => {

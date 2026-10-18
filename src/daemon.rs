@@ -431,6 +431,44 @@ impl Daemon {
         Ok(())
     }
 
+    /// A transaction we just broadcast: stored as unconfirmed in every loaded wallet it pays or
+    /// spends; stored unconfirmed transactions it replaces (same input) are dropped.
+    pub async fn note_broadcast(&self, tx: &bitcoin::Transaction) {
+        let now = chrono::Utc::now().timestamp();
+        let spent: HashSet<bitcoin::OutPoint> = tx.input.iter().map(|i| i.previous_output).collect();
+        let wallets: Vec<_> = self.wallets.read().await.values().cloned().collect();
+        for w in wallets {
+            let mut lw = w.lock().await;
+            let scripts: HashSet<bitcoin::ScriptBuf> = lw.km.scripts().into_iter().collect();
+            let ours = lw.state.coins.iter().any(|c| spent.contains(&c.outpoint)) || tx.output.iter().any(|o| scripts.contains(&o.script_pubkey));
+            if !ours {
+                continue;
+            }
+            for (old, _) in lw.store.mempool_txs().unwrap_or_default() {
+                if old != tx.compute_txid() {
+                    if let Some(t) = lw.store.get_tx(&old) {
+                        if t.input.iter().any(|i| spent.contains(&i.previous_output)) {
+                            tracing::info!("{}: {old} replaced by {}", lw.km.wallet_name(), tx.compute_txid());
+                            lw.store.delete_tx(&old).ok();
+                        }
+                    }
+                }
+            }
+            if let Err(e) = lw.store.insert_tx(tx, wallet::store::MEMPOOL_HEIGHT, &bitcoin::BlockHash::all_zeros(), 0, now) {
+                tracing::warn!("storing broadcast: {e}");
+            }
+            for o in &tx.output {
+                if let Some(k) = lw.km.key_for_script_mut(&o.script_pubkey) {
+                    k.state = wallet::KeyState::Used;
+                }
+            }
+            lw.km.save().ok();
+            if let Err(e) = lw.rebuild_state() {
+                tracing::warn!("rebuild after broadcast: {e}");
+            }
+        }
+    }
+
     /// Wasabi started while sabid runs: stop coinjoining, let critical phases finish, then exit.
     async fn wasabi_appeared(&self, what: String) {
         tracing::error!("Wasabi Wallet started: {what}. {}", crate::wasabi_guard::WARNING);

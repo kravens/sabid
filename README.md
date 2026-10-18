@@ -19,10 +19,10 @@ design notes and the progress log.
   account over the bridge API), Coldcard Mk4 on the `coinjoin-fw-2` firmware (hidraw, HSM policy).
 - Wasabi-compatible JSON-RPC, a CLI, an MCP server.
 
-Not yet: sending from a hardware wallet, payments inside coinjoins (`payincoinjoin`), fee bumps
-(`speeduptransaction`, `canceltransaction`), Passport and Krux, pure-Rust WabiSabi crypto (the
-vendored C library is used through FFI). `startcoinjoinsweep`, soft-wallet `send` and the device
-import/enable methods exist but have not run live end to end yet.
+Not yet: sending from a Trezor, payments inside coinjoins (`payincoinjoin`), Passport and Krux,
+pure-Rust WabiSabi crypto (the vendored C library is used through FFI). `startcoinjoinsweep`,
+`send`, the fee bumps and the device import/enable methods exist but have not run live end to end
+yet.
 
 ## Build
 
@@ -109,9 +109,10 @@ curl -s -u user:pass http://127.0.0.1:37128/MyWallet \
 | `listkeys` | | |
 | `excludefromcoinjoin` | `[txid, index, exclude]` | |
 | `getfeerates` | | from the node's `estimatesmartfee` |
-| `build` | `{payments, coins, feeTarget \| feeRate, password}` | soft wallets: signed transaction hex; the coins given are the inputs, change to the next internal key, RBF on |
+| `build` | `{payments, coins, feeTarget \| feeRate, password}` | signed transaction hex; the coins given are the inputs, change to the next internal key, RBF on. Soft wallets and Coldcards (device confirms, or its HSM policy decides) |
 | `send` | same | builds, broadcasts through the node, records the transaction; returns `{txid, tx}` |
-| `broadcast` | `[txHex]` | through the node |
+| `broadcast` | `[txHex]` | through the node; recorded in the wallets it touches |
+| `canceltransaction`, `speeduptransaction` | `[txId, password]` | RBF replacement hex of an unconfirmed transaction of the wallet (cancel: everything back to a fresh key; speed up: extra fee from the change output); broadcast it with `broadcast` |
 | `unlockwallet` | `[password, ttlSeconds]` | soft wallets: decrypt the key in the daemon for `ttlSeconds` (default 3600, max 86400); `getwalletinfo.unlocked` |
 | `lockwallet` | | erase the decrypted key and stop a running coinjoin after its round |
 | `startcoinjoin` | `[password, stopWhenAllMixed, overridePlebStop]` | empty password uses the unlocked key; device wallets need none |
@@ -137,10 +138,9 @@ launch `wassabeed` itself, while sabid you start by hand. Flow:
 3. `python3 sabi.py --rpc http://127.0.0.1:37128 --wallet MyWallet`.
 
 sabi's coinjoin dashboard, coin list, history, receive, start/stop and device limits use methods
-sabid has. Screens that call `payincoinjoin` or `listpaymentsincoinjoin` get a "method not
-found" error from sabid until those land (see `PLAN.md`); `startcoinjoinsweep`, `createwallet`,
-`recoverwallet`, `importhardwarewallet` and `enablecoinjoin` work; `wcli.sh` style one-liners
-work as is.
+sabid has, as do its send tab and the speed-up / cancel actions. Screens that call
+`payincoinjoin` or `listpaymentsincoinjoin` get a "method not found" error from sabid until
+those land (see `PLAN.md`); `wcli.sh` style one-liners work as is.
 
 ## MCP
 
