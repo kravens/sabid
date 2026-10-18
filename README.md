@@ -61,7 +61,9 @@ forces a proxy, `--no-tor` is for regtest only. Every coordinator identity (each
 output, status polling) gets its own circuit.
 
 Bitcoin Core: `BitcoinRpcEndPoint` and `BitcoinRpcCredentialString` from `Config.json`, reached
-over Tor when it is an onion address. With a node, unconfirmed transactions that pay or spend a
+over Tor when it is an onion or public address and directly when it is on this machine, the LAN
+or a Tailscale/VPN range (a first scan downloads every block the filters flag, over 1 GB for an
+old wallet, so a direct path to the node matters more than anything else). With a node, unconfirmed transactions that pay or spend a
 loaded wallet are picked up from its mempool every two minutes (transactions already in the
 mempool when sabid starts are only seen once they confirm). Without a node, blocks come from the
 block cache and P2P.
@@ -88,6 +90,7 @@ sabid unlock --wallet MyWallet [--ttl 3600]  # soft wallet: type the password he
 sabid lock --wallet MyWallet
 sabid rpc startcoinjoin --wallet MyWallet  # no password once unlocked (or pass '["password", true, true]')
 sabid mcp [--url http://127.0.0.1:37128/]  # MCP server on stdio
+sabid bench filters|load|rpc|fetch --wallet MyWallet   # timings, see BENCHMARKS.md
 ```
 
 ## JSON-RPC

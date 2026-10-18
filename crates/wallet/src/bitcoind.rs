@@ -24,6 +24,23 @@ pub struct Bitcoind {
     proxy: Option<String>,
 }
 
+/// Private, link-local and CGNAT (Tailscale's 100.64/10) addresses and local names are not routable
+/// from Tor exits; everything else, onion services above all, goes through the proxy.
+pub fn needs_proxy(url: &str) -> bool {
+    let host = url.split("://").nth(1).unwrap_or(url).split('/').next().unwrap_or("").rsplit_once(':').map(|(h, _)| h).unwrap_or("").trim_matches(|c| c == '[' || c == ']');
+    if host.ends_with(".onion") {
+        return true;
+    }
+    if host == "localhost" || host.ends_with(".local") || host.ends_with(".ts.net") {
+        return false;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => !(ip.is_private() || ip.is_loopback() || ip.is_link_local() || (ip.octets()[0] == 100 && (64..128).contains(&ip.octets()[1]))),
+        Ok(std::net::IpAddr::V6(ip)) => !(ip.is_loopback() || (ip.segments()[0] & 0xfe00) == 0xfc00 || (ip.segments()[0] & 0xffc0) == 0xfe80),
+        Err(_) => true,
+    }
+}
+
 impl Bitcoind {
     /// `endpoint` like `http://host:8332/`; `credentials` is `user:pass` or `cookiefile=/path`.
     pub fn new(endpoint: &str, credentials: &str, socks5: Option<&str>) -> Result<Self, RpcError> {
@@ -35,10 +52,11 @@ impl Bitcoind {
             credentials.split_once(':').map(|(u, p)| (u.to_string(), p.to_string()))
         };
         let mut b = reqwest::Client::builder().timeout(Duration::from_secs(300)).connect_timeout(Duration::from_secs(60));
-        let is_onion = url.contains(".onion");
         let mut proxy = None;
         if let Some(s) = socks5 {
-            if is_onion || !url.contains("127.0.0.1") && !url.contains("localhost") {
+            // Onion and public hosts go through Tor; a node on this machine, the LAN or a
+            // Tailscale/VPN range is reached directly (Tor exits cannot route there anyway).
+            if needs_proxy(&url) {
                 let p = format!("socks5h://sabid-bitcoind:x@{s}");
                 b = b.proxy(reqwest::Proxy::all(p.clone())?);
                 proxy = Some(p);
@@ -139,6 +157,16 @@ impl Bitcoind {
         Err(last)
     }
 
+    /// The same endpoint through its own Tor circuit (the SOCKS username picks it), with pooled
+    /// connections: parallel block fetches on distinct circuits add bandwidth instead of sharing one.
+    pub fn with_identity(&self, id: u32) -> Result<Self, RpcError> {
+        let mut b = reqwest::Client::builder().timeout(Duration::from_secs(300)).connect_timeout(Duration::from_secs(60));
+        if let Some(p) = &self.proxy {
+            b = b.proxy(reqwest::Proxy::all(p.replace("sabid-bitcoind:", &format!("sabid-bitcoind-slot{id}:")))?);
+        }
+        Ok(Self { url: self.url.clone(), auth: self.auth.clone(), http: b.build()?, proxy: self.proxy.clone() })
+    }
+
     /// Same endpoint, a new client without pooled connections and (through Tor) a new circuit:
     /// the SOCKS username selects the circuit, so a torn-down onion circuit is not reused.
     fn fresh(&self) -> Result<Self, RpcError> {
@@ -201,5 +229,19 @@ impl Bitcoind {
     pub async fn estimate_fee(&self, target: u32) -> Result<Option<f64>, RpcError> {
         let v = self.call("estimatesmartfee", json!([target, "ECONOMICAL"])).await?;
         Ok(v.get("feerate").and_then(Value::as_f64).map(|btc_per_kvb| btc_per_kvb * 100_000.0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::needs_proxy;
+    #[test]
+    fn local_lan_and_tailscale_nodes_skip_tor() {
+        for direct in ["http://127.0.0.1:8332", "http://localhost:8332", "http://192.168.1.10:8332", "http://10.0.0.5:8332", "http://100.110.11.82:8332", "http://[::1]:8332", "http://btip.tail1234.ts.net:8332"] {
+            assert!(!needs_proxy(direct), "{direct}");
+        }
+        for proxied in ["http://abcdefghijklmnop.onion:8332", "http://1.2.3.4:8332", "http://node.example.com:8332", "http://100.200.1.1:8332"] {
+            assert!(needs_proxy(proxied), "{proxied}");
+        }
     }
 }

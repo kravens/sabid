@@ -29,7 +29,13 @@ impl P2pBlockFetcher {
     pub fn new(socks: &str, network: Network) -> Self {
         // Onion peers first (no exit needed), clearnet peers reached through Tor exits as a fallback.
         let peers = match network {
-            Network::Bitcoin => MAINNET_ONION_PEERS.lines().chain(MAINNET_IPV4_PEERS.lines()).map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect(),
+            Network::Bitcoin => MAINNET_ONION_PEERS
+                .lines()
+                .chain(MAINNET_IPV4_PEERS.lines())
+                .map(|l| l.split('#').next().unwrap_or("").trim())
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect(),
             _ => Vec::new(),
         };
         Self { socks: socks.to_string(), peers, magic: Magic::from(network), good: std::sync::Mutex::new(Vec::new()) }
@@ -111,6 +117,8 @@ async fn read_msg(stream: &mut TcpStream) -> anyhow::Result<NetworkMessage> {
 }
 
 async fn fetch_from_peer(socks: &str, peer: &str, magic: Magic, hash: &BlockHash) -> anyhow::Result<Block> {
+    // Seed lines may carry a comment ("host:port # AS1234"); only the address counts.
+    let peer = peer.split('#').next().unwrap_or(peer).trim();
     let (host, port) = peer.rsplit_once(':').ok_or_else(|| anyhow::anyhow!("bad peer {peer}"))?;
     let port: u16 = port.parse()?;
     let circuit = format!("p2p-{:08x}", rand::thread_rng().next_u32());

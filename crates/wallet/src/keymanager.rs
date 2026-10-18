@@ -6,6 +6,7 @@ use bitcoin::key::{CompressedPublicKey, Secp256k1, XOnlyPublicKey};
 use bitcoin::secp256k1::All;
 use bitcoin::{Address, Network, OutPoint, PublicKey, ScriptBuf};
 use serde_json::{json, Map, Value};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +85,8 @@ pub struct KeyManager {
     taproot_xpub: Option<Xpub>,
     segwit_account: String,
     taproot_account: Option<String>,
+    /// script -> position in `keys`, extended wherever keys are appended (`load`, `ensure_gap`).
+    index: HashMap<ScriptBuf, usize>,
 }
 
 fn kind_of_path(path: &str) -> AccountKind {
@@ -158,7 +161,8 @@ impl KeyManager {
                 extra,
             });
         }
-        Ok(Self { path: path.to_path_buf(), raw, keys, secp, network, segwit_xpub, taproot_xpub, segwit_account, taproot_account })
+        let index = keys.iter().enumerate().map(|(i, k)| (k.script.clone(), i)).collect();
+        Ok(Self { path: path.to_path_buf(), raw, keys, secp, network, segwit_xpub, taproot_xpub, segwit_account, taproot_account, index })
     }
 
     pub fn wallet_name(&self) -> String {
@@ -269,12 +273,21 @@ impl KeyManager {
         self.raw.insert("ExcludedCoinsFromCoinJoin".into(), Value::Array(arr));
     }
 
+    fn position_of(&self, script: &ScriptBuf) -> Option<usize> {
+        if self.index.len() == self.keys.len() {
+            self.index.get(script).copied()
+        } else {
+            // Keys appended without the index: still correct, just the old linear scan.
+            self.keys.iter().position(|k| &k.script == script)
+        }
+    }
+
     pub fn key_for_script(&self, script: &ScriptBuf) -> Option<&HdKey> {
-        self.keys.iter().find(|k| &k.script == script)
+        self.position_of(script).map(|i| &self.keys[i])
     }
 
     pub fn key_for_script_mut(&mut self, script: &ScriptBuf) -> Option<&mut HdKey> {
-        self.keys.iter_mut().find(|k| &k.script == script)
+        self.position_of(script).map(move |i| &mut self.keys[i])
     }
 
     /// Scripts sabid scans for: every loud key (segwit, taproot, SLIP-25).
@@ -342,7 +355,10 @@ impl KeyManager {
                 if new_keys.is_empty() {
                     break;
                 }
-                self.keys.extend(new_keys);
+                for k in new_keys {
+                    self.index.insert(k.script.clone(), self.keys.len());
+                    self.keys.push(k);
+                }
                 changed = true;
             }
         }

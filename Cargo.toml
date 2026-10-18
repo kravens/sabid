@@ -47,4 +47,5 @@ dirs = "6"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 zeroize = "1"
+libc = "0.2"
 bip39 = { version = "2", features = ["rand"] }

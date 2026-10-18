@@ -3,8 +3,10 @@ mod config;
 mod daemon;
 mod devices;
 mod mcp;
+mod mem;
 mod methods;
 mod rpc;
+mod bench;
 mod secrets;
 mod send;
 mod tor;
@@ -75,6 +77,35 @@ enum Cmd {
         #[arg(long)]
         wallet: String,
     },
+    /// Timings: filter matching, wallet load, RPC latency (see BENCHMARKS.md)
+    Bench {
+        /// filters | load | rpc | all
+        what: String,
+        #[arg(long)]
+        wallet: String,
+        #[arg(long)]
+        wallet_dir: Option<PathBuf>,
+        /// Filters to match (default 20000) from height --from (default: the first filter)
+        #[arg(long, default_value_t = 20000)]
+        filters: usize,
+        #[arg(long)]
+        from: Option<u32>,
+        /// Matching threads (default: all cores)
+        #[arg(long)]
+        threads: Option<usize>,
+        /// RPC URL of a running daemon for the rpc benchmark (default: from Config.json)
+        #[arg(long)]
+        url: Option<String>,
+        /// Calls per RPC method
+        #[arg(long, default_value_t = 20)]
+        calls: usize,
+        /// Blocks to fetch for the fetch benchmark (consecutive, from --from or a random height)
+        #[arg(long, default_value_t = 12)]
+        blocks: usize,
+        /// Fetches in flight for the fetch benchmark
+        #[arg(long, default_value_t = 4)]
+        concurrency: usize,
+    },
     /// List hardware wallets: Trezor bridge devices and a Coldcard on USB (with its HSM state)
     Devices,
     /// Model Context Protocol server on stdio for agents (thin client of a running daemon)
@@ -138,6 +169,7 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,hyper=warn,reqwest=warn".into()))
         .init();
     let cli = Cli::parse();
+    mem::setup();
     let mut cfg = match &cli.config {
         Some(p) => config::WasabiConfig::load(p)?,
         None => config::WasabiConfig::load_default()?,
@@ -273,6 +305,53 @@ async fn main() -> anyhow::Result<()> {
                     println!("imported {n} transactions for {wallet}; synced height set to {synced}");
                 }
                 None => println!("imported {n} transactions for {wallet}; no filter for height {synced}, scan starts at the birth height"),
+            }
+        }
+        Cmd::Bench { what, wallet, wallet_dir, filters, from, threads, url, calls, blocks, concurrency } => {
+            let own = cli.datadir.join(net_dir).join("Wallets").join(format!("{wallet}.json"));
+            let wallet_file = match wallet_dir {
+                Some(d) => d.join(format!("{wallet}.json")),
+                None if own.exists() => own,
+                None => config::wasabi_data_dir().join("Wallets").join(format!("{wallet}.json")),
+            };
+            let own_net_dir = cli.datadir.join(net_dir);
+            println!("| benchmark | setup | result |\n|---|---|---|");
+            if what == "filters" || what == "all" {
+                let store = wallet::filters::FilterStore::open(Some(&config::wasabi_data_dir().join("BitcoinStore").join(net_dir).join("IndexStore/IndexStore.sqlite")), &own_net_dir.join("filters.sqlite"))?;
+                let from = from.unwrap_or_else(|| wallet::filters::first_height(network));
+                let threads = threads.unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+                bench::filters(&wallet_file, &store, from, filters, threads)?;
+            }
+            if what == "load" || what == "all" {
+                bench::load(&wallet_file, &own_net_dir.join(format!("{wallet}.sqlite")))?;
+            }
+            if what == "fetch" {
+                // Blocks through the daemon's sources (node over Tor, P2P), never from a cache: a
+                // throwaway block directory, and heights nobody scanned before unless --from says so.
+                let tor_handle = if cli.socks.is_none() { Some(tor::ensure_tor(None, None, &cli.datadir).await?) } else { None };
+                let socks = cli.socks.clone().or_else(|| tor_handle.as_ref().map(|t| t.socks.clone()));
+                let node = (!cfg.bitcoin_rpc_end_point.is_empty()).then(|| wallet::bitcoind::Bitcoind::new(&cfg.bitcoin_rpc_end_point, &cfg.bitcoin_rpc_credential_string, socks.as_deref())).transpose()?;
+                let src = wallet::sync::BlockSource {
+                    wasabi_blocks_dir: None,
+                    own_blocks_dir: std::env::temp_dir().join(format!("sabid-bench-fetch-{}", std::process::id())),
+                    bitcoind: node,
+                    node_pool: Vec::new(),
+                    next_slot: std::sync::atomic::AtomicUsize::new(0),
+                    p2p: socks.as_deref().map(|s| wallet::p2p::P2pBlockFetcher::new(s, network)).filter(|p| p.has_peers()),
+                }
+                .with_node_pool();
+                let store = wallet::filters::FilterStore::open(Some(&config::wasabi_data_dir().join("BitcoinStore").join(net_dir).join("IndexStore/IndexStore.sqlite")), &own_net_dir.join("filters.sqlite"))?;
+                let tip = store.tip_height().unwrap_or(0);
+                let start = from.unwrap_or_else(|| wallet::filters::first_height(network) + rand::random::<u32>() % tip.saturating_sub(wallet::filters::first_height(network) + blocks as u32).max(1));
+                let hashes: Vec<bitcoin::BlockHash> = store.range(start, blocks)?.into_iter().map(|r| r.block_hash).collect();
+                let (per_s, mb_s) = wallet::sync::bench_fetch(&src, &hashes, concurrency).await?;
+                println!("| block fetch | {} blocks from {start}, {concurrency} in flight, node {} | {:.2} blocks/s, {:.2} MB/s |", hashes.len(), if src.bitcoind.is_some() { "yes" } else { "no" }, per_s, mb_s);
+                std::fs::remove_dir_all(&src.own_blocks_dir).ok();
+                drop(tor_handle);
+            }
+            if what == "rpc" || what == "all" {
+                let base = url.unwrap_or_else(|| cfg.json_rpc_server_prefixes.first().cloned().unwrap_or_else(|| "http://127.0.0.1:37128/".into()));
+                bench::rpc(&base, &cfg.json_rpc_user, &cfg.json_rpc_password, &wallet, calls).await?;
             }
         }
         Cmd::Devices => {
